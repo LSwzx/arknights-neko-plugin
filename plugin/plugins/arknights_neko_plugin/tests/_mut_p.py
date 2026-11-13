@@ -1,0 +1,88 @@
+"""P 组变异验牙：只挑三条"守卫型"用例。每个变异都必须让指定用例红。"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import test_contract as T
+import maa.provision as P
+
+
+def run(fn, name):
+    try:
+        fn()
+    except BaseException as e:  # noqa: BLE001
+        first = str(e).splitlines()[0] if str(e) else type(e).__name__
+        print(f"  [杀] {name}: {type(e).__name__}: {first[:110]}")
+        return True
+    print(f"  [存活!] {name}")
+    return False
+
+
+results = []
+
+# M-P1：把"先判路径、后判排除"反过来（穿越样本被排除逻辑静默跳过）
+orig_check = P._check_member_name
+
+
+def lenient(name, zp, destp):
+    # 变异：完全跳过穿越检测（等价于"先判排除、后判路径"的反向顺序）
+    parts = tuple(p for p in name.replace("\\", "/").split("/") if p not in ("", "."))
+    return parts or ("x",)
+
+
+orig_dir = P._ensure_dir_no_symlink
+
+
+def naive_dir(destp, parts, dest_real, zp, tdir):
+    # 变异：写出阶段也不再校验（两处防线一起拆掉）
+    target = Path(destp).joinpath(*parts) if parts else Path(destp)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+P._check_member_name = lenient
+P._ensure_dir_no_symlink = naive_dir
+try:
+    results.append(("M-P1 两处路径校验都拆掉", run(T.test_p11_path_check_precedes_exclusion, "P11")))
+    results.append(("M-P1b 两处路径校验都拆掉（P01）", run(T.test_p01_malicious_member_names_rejected, "P01")))
+finally:
+    P._check_member_name = orig_check
+    P._ensure_dir_no_symlink = orig_dir
+
+# M-P2：哈希比较恒真（"校验了但等于没校验"）
+orig_cmp = P.hmac.compare_digest
+P.hmac.compare_digest = lambda a, b: True
+try:
+    results.append(("M-P2 哈希比较恒真", run(T.test_p16_hash_mismatch_deletes_dest_and_part, "P16")))
+finally:
+    P.hmac.compare_digest = orig_cmp
+
+# M-P3：取消归到 network（用户会看到"网络错误"并反复重试）
+orig_dl = P.atomic_download
+
+
+def wrong_cancel(release, dest, **kw):
+    try:
+        return orig_dl(release, dest, **kw)
+    except P.EngineDownloadFailed as exc:
+        if getattr(getattr(exc, "kind", None), "value", "") == "cancelled":
+            raise P.EngineDownloadFailed(
+                url=release.url, target=Path(dest),
+                kind=P.DownloadFailure.NETWORK, detail="cancelled",
+            ) from None
+        raise
+
+
+P.atomic_download = wrong_cancel
+try:
+    results.append(("M-P3 取消归成 network", run(T.test_p25_cancel_leaves_no_residue, "P25")))
+finally:
+    P.atomic_download = orig_dl
+
+print()
+print(f"变异总数 {len(results)}，杀死 {sum(1 for _n, ok in results if ok)}")
+for name, ok in results:
+    print(f"  {'✓' if ok else '✗'} {name}")
+sys.exit(0 if all(ok for _n, ok in results) else 1)

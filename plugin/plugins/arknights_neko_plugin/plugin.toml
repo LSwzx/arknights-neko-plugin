@@ -1,0 +1,69 @@
+# N.E.K.O 插件清单 —— 明日方舟陪玩插件（重构版）
+# 参考：https://project-neko.online/zh-CN/plugins/plugin-toml
+#
+# 三个"必须一致"的身份串（宿主按它们校验，任一处不一致就拒载或 404）：
+#   目录名   = arknights_neko_plugin
+#   [plugin].id = arknights_neko_plugin
+#   [plugin].entry 的包路径 = plugin.plugins.arknights_neko_plugin:<类名>
+# 类名必须与 __init__.py 里 @neko_plugin 标注的类同名。
+
+[plugin]
+id = "arknights_neko_plugin"
+name = "明日方舟陪玩插件"
+version = "0.2.0"
+type = "plugin"
+description = "内置 MAA (MaaAssistantArknights) 引擎的明日方舟陪玩插件：截图、引擎状态、关卡分析、肉鸽建议。**只读陪玩，不代打**——不执行战斗、不调基建/招募/商店等写任务，不修改客户端。首次启动会从 MAA 官方 Release 下载引擎（约 295 MB），下载在后台进行，不阻塞启动。"
+short_description = "内置 MAA 引擎的明日方舟陪玩插件（只读、不代打）"
+keywords = ["明日方舟", "Arknights", "MAA", "陪玩", "截图", "肉鸽", "roguelike", "关卡", "干员"]
+# 宿主加载入口：`模块路径:类名`。模块路径必须是 `plugin.plugins.<插件目录名>`，
+# 宿主会归一化成 `plugins.<插件目录名>` 并在子进程内按目录加载。
+entry = "plugin.plugins.arknights_neko_plugin:ArknightsNekoCompanion"
+
+[plugin.author]
+name = "N.E.K.O 猫娘计划"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+# 键值存储（self.store）：缓存干员/仓库识别结果与最近关卡。
+# 读写失败一律回落 None，不影响入口成败。
+[plugin.store]
+enabled = true
+
+# 结构化 SQLite（self.db）。本轮设计只用 store（记忆是几个小键值，不需要表）；
+# 这里按交付要求显式声明，为后续"历史记录/统计"预留。
+# TODO_VERIFY(G2)：该段除 enabled 之外的字段清单尚未在上游文档核实，
+# 所以**只写 enabled**，不凭记忆加字段（写错的字段会让宿主整段解析失败）。
+[plugin.database]
+enabled = true
+
+# 运行方式。
+# auto_start = true 是**功能正确性**要求，不是为了好看：service/runtime 都在
+# on_startup 里构造，不自动启动的话每个入口都只能回"引擎还没准备好"。
+# 首次启动的 295 MB 下载由 bootstrap() 起后台任务完成，startup 立即返回，
+# 因此不会撞宿主的 timeout 预算。
+# startup_failure = "warn"：钩子万一抛错时保留进程并标记降级，而不是判插件启动失败。
+[plugin_runtime]
+enabled = true
+auto_start = true
+timeout = 30
+startup_failure = "warn"
+
+# ---------------------------------------------------------------------------
+# 业务配置段（自定义顶层段，官方 SDK 支持）。
+# 只读白名单键：adb_address / adb_path / verbose_diagnostics / max_inline_image_mb。
+# **没有 maa_root / resource_dir 之类的路径配置**：引擎只有一个权威位置
+# = data_path("maa")，不读外部路径、不探测 winget/注册表/环境变量（D6）。
+# ---------------------------------------------------------------------------
+[arknights]
+# 模拟器/设备的 ADB 地址，形如 "127.0.0.1:5555"。
+# **留空就是不连**（会明确提示"还没告诉我地址，所以我根本没去连"），绝不回落 5555——
+# 各家模拟器、同一家不同版本的端口都不一样，写死一个数字只会让用户"照抄了还是连不上"。
+adb_address = ""
+# adb 可执行文件路径；留空则用 MAA 内置的 adb。
+adb_path = ""
+# 诊断模式：true 时会在 entry 的 data 里带更多**结构化**字段（仍然不含绝对路径、不进聊天窗）。
+verbose_diagnostics = false
+# 内联图片上限（MB）。超过就先走 ctx.images.upload，上传不可用时降级落盘给路径。
+max_inline_image_mb = 2

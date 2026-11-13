@@ -1,0 +1,63 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---- 本地日志与临时文件 ----
+*.log
+*.tmp
+*.bak
+*.orig
+
+# ---- 引擎二进制（绝不入库）----
+# MAA 的 MaaCore 由首次启动自动下载并校验 SHA256，不进版本库：
+# ① 体积（解压后约 300MB+）② 供应链审计要求"能复核的只有 Release 里那一份"。
+*.dll
+*.so
+*.so.*
+*.dylib
+*.pyd
+*.exe
+*.lib
+*.a
+*.msi
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.part
+maa.unpacking-*
+maa.old-*
+
+# ---- 运行期产物 ----
+data/
+cache/
+resource/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+engine.json
+
+# ---- 本地快照 / 备份 ----
+_snapshots/
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Agent 本地状态（按需保留在磁盘，不入库）----
+.workbuddy/
