@@ -1,0 +1,34 @@
+# 首次运行的运行时配置模板。
+# 注意：这里只放「业务配置段」（本插件为 [arknights]）。
+# 不要放 [plugin] / [plugin_runtime] 等 manifest 段 —— 运行时会与 plugin.toml
+# 做 deep_merge（manifest 为底、本文件为覆盖），写在这里会覆盖用户在插件中心
+# 保存的启停/超时偏好。业务默认值请写在 plugin.toml 的自定义段里。
+#
+# 存放位置：<用户数据根目录>/plugins/arknights_neko_plugin/config/plugin.toml
+
+[arknights]
+# 模拟器 / 设备的 ADB 地址，形如 "127.0.0.1:5555"。
+# **留空就是不连**：不会回落到 5555 —— 各家模拟器、同一家不同版本的端口都不一样，
+# 写死一个数字只会让用户"照抄了还是连不上"。留空时入口会明确回
+# "还没告诉我地址，所以我根本没去连"（错误码 adb.address_missing）。
+adb_address = ""
+
+# adb 可执行文件路径；留空则用 MAA 内置的 adb。
+# 需要指定时填绝对路径（如 C:\platform-tools\adb.exe）。
+adb_path = ""
+
+# 诊断模式：true 时入口的 data 里会带更多**结构化**字段
+# （仍然不含绝对路径、不进聊天窗）。
+verbose_diagnostics = false
+
+# 内联图片上限（MB）。超过就先走 ctx.images.upload 推图，
+# 上传不可用时降级落盘并返回路径。缺省 / 非法值一律回落 2 MB。
+max_inline_image_mb = 2
+
+# --- 以下键**故意不存在**，不要加（加了也不会生效，且会让人以为能改） ---
+# resource_dir / maa_log_dir / maa_root：引擎路径只有 data_path("maa") 一个权威位置，
+#   运行时不会探测 winget / 注册表 / 环境变量 / 本机已装的 MAA。
+#   要手动放置引擎，把 MAA Release 解压进 data_path("maa") 的**真实**路径
+#   （从 arknights_status 的 data.engine_root 读），再调 arknights_engine_repair。
+# engine_url / mirror / download_source：下载地址与 SHA256 是硬编码常量
+#   （maa/provision.py 的 KNOWN_RELEASES），换源必须改常数并发版 —— 这是安全边界。

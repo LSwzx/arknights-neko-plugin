@@ -83,11 +83,26 @@ elif variant == "M-S6":
         '            ),',
     )
 elif variant == "M-S7":
-    # 消毒函数退回"只 strip"：换行重新变成指令块边界
+    # 恒等基线：折叠还在、但不折任何东西（云安要求的"机制"变异——
+    # 任何正向样本都必须因此变红；它同时防"实现退化成什么都不折"）
     patch(
         "companion/service.py",
-        '    collapsed = _PATH_FOLD.sub("<path>", " ".join("".join(kept).split()))',
-        '    collapsed = raw.strip()',
+        "    folded = _fold_paths(collapsed)\n",
+        "    folded = collapsed\n",
+    )
+elif variant == "M-S8b":
+    # 折叠改成"整段丢弃"：泄漏没了，但诊断词也没了（把失明当安全）
+    patch(
+        "companion/service.py",
+        '    if not text:\n        return ""\n    out: list[str] = []\n    in_path_run = False',
+        '    if not text:\n        return ""\n    return ""\n    out: list[str] = []\n    in_path_run = False',
+    )
+elif variant == "M-S8c":
+    # 删掉凭据参数规则：只有裸查询串（token=… / ?sig=…）会因此转红
+    patch(
+        "companion/service.py",
+        "    | (?i:(?<![A-Za-z0-9_])(?:sig|sv|se|sp|token|key|signature)=)  # 凭据参数（SAS）\n",
+        "    | (?i:(?:NEVER_MATCHES_THIS)=)  # 凭据参数（SAS）\n",
     )
 else:
     raise SystemExit(f"未知变异 {variant}")

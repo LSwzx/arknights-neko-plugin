@@ -45,6 +45,7 @@ push_message（v2）的三条硬规则
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -194,8 +195,10 @@ _COPY: Final[Mapping[ErrorCode, ErrorCopy]] = {
             ),
             DownloadFailure.ASSET_GONE.value: _variant(
                 "官方那个版本的文件已经找不到了喵",
+                # priority 走主条的 3（§3.5.1：download 八档只有 cancelled=2，其余七档统一 3）。
+                # "官方没这个文件了"确实没救，但**不是紧急**：用户此刻没有可执行动作，
+                # 抬到 4/5 只会把它顶到用户正在说的话前面（S04）。
                 "这条只能靠升级插件解决：我不接受任意下载地址，换源必须改常量表并发版。",
-                priority=4,
             ),
             DownloadFailure.SIZE_MISMATCH.value: _variant(
                 "下下来的大小和清单对不上喵",
@@ -203,13 +206,13 @@ _COPY: Final[Mapping[ErrorCode, ErrorCopy]] = {
             ),
             DownloadFailure.NO_SPACE.value: _variant(
                 "磁盘放不下喵（要差不多 1.5 GB）",
+                # 同上：priority 3。"清空间"是用户**稍后**做的动作，不是当场打断的理由。
                 "清一点空间，再点 arknights_engine_repair。",
-                priority=4,
             ),
             DownloadFailure.REJECTED_SCHEME.value: _variant(
                 "下载地址不是 https 或不在白名单里喵，我没敢下",
+                # 同上：priority 3。安全边界拦下来了，是**已经安全**的状态，不必抢注意力。
                 "这是安全边界，改不了；如果一直这样请把这条报告给维护者。",
-                priority=5,
             ),
             # ↓ 实测存在"并发锁/权限"导致的写盘失败：它**不是网络问题**。
             DownloadFailure.WRITE_ERROR.value: _variant(
@@ -437,16 +440,172 @@ def _is_kept_char(char: str) -> bool:
     return False
 
 
+_PATH_PLACEHOLDER: Final[str] = "<路径>"
+"""路径折叠后的占位符。与 ``maa/errors.py::_display_scalar`` 的 ``<path>`` 同口径
+（同一个意思：这里曾经是一个路径；**字面用中文**是因为它会被用户读到）。
+
+``<`` ``>`` 都在 ASCII 可见区（``0x20–0x7E``），所以占位符本身不会被打回空白 ——
+但更关键的是：**折叠发生在字符白名单之后**，占位符是后插进去的，压根不经过白名单。
+"""
+
+_ZERO_WIDTH_DROP: Final[Mapping[int, None]] = dict.fromkeys(
+    (
+        0x200B, 0x200C, 0x200D, 0x2060,          # 零宽空格 / 非连接 / 连接 / 词连接
+        0xFEFF,                                   # BOM / 零宽不换行空格
+        *range(0x202A, 0x202F),                   # bidi 嵌入 / 覆盖 / 隔离 202A–202E
+        *range(0x2066, 0x206A),                   # bidi 隔离 2066–2069
+    )
+)
+"""**删除**（不是替换成空格）的不可见字符表。
+
+为什么是删除而不是打空格：白名单把零宽字符打成空格，会把一个 token **劈成两半** ——
+``C:\\adb\\adb.exe`` 里塞一个零宽字符就变成 ``C: <路径>``，残留裸盘符；
+而且"用零宽字符把敏感词拆开"本身是一种注入花招。先删掉，token 才保持完整，
+折叠规则也才看得见整条路径。
+"""
+
+_PATH_HINT_RE: Final[re.Pattern[str]] = re.compile(
+    r"""
+      (?<![A-Za-z0-9_])[A-Za-z]:[\\/]      # C:\dir  /  D:/dir（左边界防 localhost:5555）
+    | (?<![A-Za-z0-9_])[A-Za-z]:[^\\/\s]   # C:foo（盘符相对，冒号后不是分隔符）
+    | \\\\                                 # \\host\share  /  \\?\C:\  /  \\.\Device
+    | \\                                   # 任何残留反斜杠（Windows 路径片段，如 a\b.exe）
+    | ~[\\/]                               # ~/...  ~\...（家目录）
+    | [A-Za-z][A-Za-z0-9+.\-]*://          # file://...  https://...（scheme URI）
+    | (?i:(?:\$home|\$\{home\}|%userprofile%|%appdata%)[\\/])   # $HOME 与 %APPDATA%
+    | (?i:(?<![A-Za-z0-9_])(?:sig|sv|se|sp|token|key|signature)=)  # 凭据参数（SAS）
+    | (?:^|[=:(\["'`,（\[\uFF08])/         # 任意 POSIX 绝对路径（允许 `path=` `(` "--x=" 壳）
+    """,
+    re.VERBOSE,
+)
+"""token 里**出现就算路径**的形态表。
+
+为什么要"出现就算"而不是"整 token 相等"：上游文本里的路径常常带壳
+（``(C:\adb\adb.exe)``、``path=C:\adb\adb.exe,``、``--arg=/sdcard/a.png``）。
+按 token 全等匹配会整片漏掉。代价是 ``a\b`` 这种也会被折 —— 在 MAA 的报错文本里
+这仍然比泄漏路径好。
+
+三个刻意的细节（都是实测踩出来的，见 ``02-test-plan.md`` §4.3）：
+
+* **盘符相对要有左边界**（``(?<![A-Za-z0-9_])``）：没有它，``localhost:5555`` 里的
+  ``t:5``、``timeout:30`` 里的 ``t:3`` 都会被当成 ``C:foo`` 折掉 —— 折完只剩
+  ``<路径> refused``，既没地址也没超时值，比泄漏更难排查，而且 ``timeout`` 会被
+  "救命稻草"逻辑搬到占位符后面、``30`` 直接消失。左边界必须赏在 ``:`` 之前那个字符上；
+* **POSIX 必须允许"壳前缀"**（``path=`` / ``(`` / ``"`` / ``--arg=``）：上游文本里的
+  POSIX 路径几乎总带壳。只写 ``^/`` 时，``/sdcard/a.png`` 能折、``path=/sdcard/a.png``
+  原样泄漏 —— 那是**样本形态造成的假绿**，不是规则真的生效；
+* **凭据参数不看有没有 ``?``/``&``**：``urllib`` 的异常文本常常是不带 scheme 的裸查询串
+  （``token=SECRET`` / ``?sv=…&sig=…``），只有这一条能救它；``[?&]`` 前缀会让
+  ``token=…`` 这种**行首**样本永远漏过（实测踩过）。
+
+两类"不是路径、但同样不能出模型"的形态也放在这张表里：
+
+* ``$HOME/`` / ``%APPDATA%\\``：环境变量壳的家目录，展开后就是用户名；
+* ``sig=`` / ``sv=`` / ``token=`` 这类**凭据参数**：SAS / 预签名 URL 里的 token，
+  泄漏要**轮换凭据**，比泄漏路径高一档。
+
+明显**不做**的两类（加规则只会误伤正常文本）：百分号编码的路径（``C%3A%5C…``，
+MAA 不产出）、纯相对路径（``./adb.exe``，不含用户信息）。
+
+**写这张表的一条纪律**：``re.VERBOSE`` 下注释到行尾结束，但**注释末尾的反斜杠仍然会
+续行**，把下一行整条规则吞成注释 —— 规则编译得进去、却永远匹配不到（"写了规则但它是
+死的"，§4.3 第 5 类假绿）。注释不许以反斜杠结尾。
+"""
+
+_DIAG_KEYWORD_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?<![A-Za-z0-9_.])"
+    r"(?:timed out|timeout|refused|denied|not found|failed|missing"
+    r"|error|symbol|unable|invalid)"
+    r"(?![A-Za-z0-9_.])",
+    re.IGNORECASE,
+)
+"""诊断关键词：**折叠之后必须还在**。
+
+为什么需要它：路径常常和原因贴在一个 token 里（``C:\\adb\\adb.exe:refused``、
+``path=C:\\x.exe,failed``）。整 token 替换会把原因一起吃掉，用户看到
+「引擎原话：``<路径>``」等于没有线索 —— 而这段引用存在的唯一意义就是把原因带给他。
+
+那两个 ``(?<![A-Za-z0-9_.])`` / ``(?![A-Za-z0-9_.])`` 边界是**故意收紧**的：
+``error.log`` 里的 ``error`` 属于文件名，不是诊断词，不该被捞出来当原因。
+"""
+
+
+def _diag_keywords(token: str) -> tuple[str, ...]:
+    """token 里的诊断关键词，按出现顺序去重（大小写不同算同一个）。"""
+    seen: list[str] = []
+    lowered: set[str] = set()
+    for match in _DIAG_KEYWORD_RE.findall(token):
+        key = match.lower()
+        if key not in lowered:
+            lowered.add(key)
+            seen.append(match)
+    return tuple(seen)
+
+
+def _fold_paths(text: str) -> str:
+    """把每个空白分隔的 token 里的路径**整段**换成 :data:`_PATH_PLACEHOLDER`。
+
+    四个刻意的取舍：
+
+    * **只在 token 边界上折**：路径里的空格会把一个路径拆成两个 token
+      （``C:\\Program Files\\x.exe``）。第二个 token 含反斜杠，同样命中
+      :data:`_PATH_HINT_RE`，所以两段都被折掉 —— 不需要写一个"猜路径到哪结束"的正则；
+    * **续段靠上下文，不靠"含分隔符就算"**（``C:/Program Files/My Company/secret.dll``）：
+      第一段折掉之后，**紧跟着的、含 ``/`` 或 ``\\`` 的 token 继续折，遇到纯词 token 停**。
+      为什么不用 ``\\S*[\\\\/]\\S*``：那条会把 ``6/22``、``and/or``、``10061`` 全折掉 ——
+      MAA 的报错文本里"错误码 10061 / 日期 6/22"比路径还常见。上下文规则能同时满足：
+      ``C:/Program Files/My Company/secret.dll`` → ``<路径>``，而
+      ``MAA 6/22 refused`` / ``this and/or that`` 原样；
+    * **同 token 里的诊断关键词要捞回来**：``C:\\adb\\adb.exe:refused`` →
+      ``<路径> refused``。这是"折掉了路径、但留下了原因"；和"什么都不折"是两个极端，
+      中间这条才是用户要的；
+    * **连续占位符合并成一个**：``C:\\a C:\\b`` 折成 ``<路径> <路径>`` 是噪音，
+      用户只需要知道"这里原来是路径"。
+
+    幂等：``<路径>`` 本身不命中任何形态（``<`` ``>`` 不在任何形态里），二次消毒原样返回。
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    in_path_run = False               # 上一个 token 是不是刚被折过（续段判据）
+    for token in text.split(" "):
+        if not token:
+            continue
+        continued = in_path_run and ("/" in token or "\\" in token)
+        if continued or _PATH_HINT_RE.search(token):
+            keywords = _diag_keywords(token)
+            piece = _PATH_PLACEHOLDER + (" " + " ".join(keywords) if keywords else "")
+            in_path_run = True
+        else:
+            piece = token
+            in_path_run = False
+        if piece == _PATH_PLACEHOLDER and out and out[-1] == _PATH_PLACEHOLDER:
+            continue
+        out.append(piece)
+    return " ".join(out)
+
+
 def sanitize_maa_text(text: str, *, limit: int = 120) -> str:
     """把 MAA / adb 的原文洗成"可以给人看、也可以进模型"的一段短文本。
 
     规则（顺序不可换）：
 
+      0. **删不可见字符**：零宽空格/连接符、bidi 嵌入覆盖符先 ``translate`` **删掉**
+         （不是打空格——打空格会把一个 token 劈成两半，残留裸盘符 ``C:``）；
       1. **字符白名单**：保留中日韩/拉丁/数字/常用标点，其余替换为空格
-         （控制字符、零宽字符、bidi 覆盖符、换行都在"其余"里）；
+         （控制字符、换行都在"其余"里）；
       2. **空白折叠**：连续空白压成一个空格并 strip（换行折叠是重点：
          多行文本会被模型读成新的指令块）；
-      3. **截断**：超过 ``limit`` 字就截到 ``limit-1`` 再补 ``…``。
+      3. **路径折叠**（S08 / K8）：盘符、UNC、``file://``、``$HOME/``、凭据参数、
+         POSIX 绝对路径整段换成 ``<路径>``，**同 token 里的诊断关键词（``refused`` /
+         ``denied`` / ``timeout`` …）捞回占位符后面**。
+         **必须在截断之前**做 —— 否则长路径先被截成半截盘符，形态规则就匹配不到了，
+         剩下的半截照样是泄漏；
+      4. **截断**：超过 ``limit`` 字就截到 ``limit-1`` 再补 ``…``，
+         且**以占位符为原子**（切点落在 ``<路径>`` 中间就退到它的起点）。
+
+    路径折叠这一步不是"锦上添花"：``why`` 这类上游文本里最常见的机器值就是
+    路径（``C:\\adb\\adb.exe refused``），它比任何文件内容都更容易暴露用户名与目录结构。
 
     ``AdbDisconnected.why`` / MAA 回调里的 ``detail`` 这类文本**给用户或模型之前
     必须过它**，且只能作为**引用数据**单独成一段 —— 不拼进猫娘主句，
@@ -457,15 +616,42 @@ def sanitize_maa_text(text: str, *, limit: int = 120) -> str:
     raw = text if isinstance(text, str) else str(text)
     if limit <= 0:
         return ""
+    raw = raw.translate(_ZERO_WIDTH_DROP)     # 先删不可见字符，再进白名单（否则 token 会被劈开）
     kept = []
     for char in raw:
         kept.append(char if _is_kept_char(char) else " ")
     collapsed = " ".join("".join(kept).split())
-    if len(collapsed) <= limit:
-        return collapsed
+    folded = _fold_paths(collapsed)
+    return _truncate(folded, limit)
+
+
+def _truncate(text: str, limit: int) -> str:
+    """按 ``limit`` 截断，**不切开占位符**。
+
+    为什么单独成函数：``<路径>`` 被切成 ``<路径…`` 之后，那半个 ``<`` 既不是标签也不是
+    文本，模型读到的是"格式坏掉的串"—— 而且它会**原样进模型**。占位符是原子，
+    切点落在它中间就退到它的起点（宁可少一段信息，也不留破损标记）。
+
+    退化情形：退到起点后为空（文本全是一个长占位符）→ 返回 ``…``，仍满足
+    ``len(out) <= limit``。
+    """
+    if len(text) <= limit:
+        return text
     if limit == 1:
         return "…"
-    return collapsed[: limit - 1].rstrip() + "…"
+    cut = text[: limit - 1]
+    start = 0
+    while True:
+        start = text.find(_PATH_PLACEHOLDER, start)
+        if start < 0:
+            break
+        end = start + len(_PATH_PLACEHOLDER)
+        if start < len(cut) < end:            # 切点落在占位符内部
+            cut = text[:start]
+            break
+        start = end
+    cut = cut.rstrip()
+    return (cut + "…") if cut else "…"
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +737,13 @@ def render_error(
                 .format(root_hint=fields["engine_root"])
             ))
         else:
-            missing = ", ".join(str(item) for item in getattr(exc, "missing", ())) or "关键文件"
+            # ``missing`` 是**主句里的数据**，是全模块唯一一条"拼进主句"的异常字段，
+            # 所以它必须逐项过折叠：现在 provision 只塞 ``resource/`` 这类相对件名，
+            # 但没有任何东西阻止将来有人塞 ``str(destp / "resource")`` 进来。
+            # 相对件名不含任何路径形态，折叠对它是恒等变换（不会把件名改成 <路径>）。
+            missing = ", ".join(
+                _fold_paths(str(item)) or str(item) for item in getattr(exc, "missing", ())
+            ) or "关键文件"
             parts.append(_text(f"解开了，但里面缺东西喵（缺：{missing}）。"))
             parts.append(_text(
                 "换官方 Release 包重新下一次；要放的位置是 {root_hint}。".format(
@@ -803,6 +995,34 @@ _PUSH_REJECT_HINT: Final[Mapping[str, str]] = {
 **不重试**：同一轮里重试只会放大 backpressure；重试与去重是插件策略，
 但"立刻重试"不是，它是放大器。
 """
+
+_STABLE_PUSH_REASONS: Final[frozenset[str]] = frozenset(_PUSH_REJECT_HINT)
+"""宿主**只保证**这三个 ``reason`` 值是稳定的；白名单外的一律不是"码"。
+
+为什么要归一：下游（``push_failure_reason`` / ``diagnostics``）按码处置。
+一旦把宿主的自由文本原样回传，就会凭空出现"第四个稳定码"，
+而它明天可能变成另一句话 —— 那不是契约，是翻译。
+"""
+
+
+def _normalize_push_reason(raw: Any) -> str:
+    """把宿主给的 ``reason`` 归一成三个稳定码之一（S06）。
+
+    * 白名单内 → 原样返回；
+    * 大小写/空白抖动 → 按 ``strip().lower()`` 归一后再判（容忍
+      ``"Backpressure"`` / ``" backpressure "``，语义没变）；
+    * 缺失 / 非字符串 / 空串 / 白名单外 → ``"transport_error"``。
+
+    **不做模糊匹配**：``"backpressure-ish"`` 不是 ``backpressure``。
+    猜错方向比承认"不知道怎么归类"更危险 —— 后者至少是保守的（不重试、不静默）。
+    """
+    if isinstance(raw, str):
+        token = raw.strip().lower()
+        if token in _STABLE_PUSH_REASONS:
+            return token
+    if raw not in (None, ""):
+        logger.info("push_message returned unknown reason %r, folded to transport_error", raw)
+    return "transport_error"
 
 
 class CompanionService:
@@ -1308,7 +1528,13 @@ class CompanionService:
 
     @staticmethod
     def _interpret_push_result(result: Any) -> tuple[bool, str | None]:
-        """读 push 的返回值。判据是 ``submitted``；``ok`` 只是旧兼容。"""
+        """读 push 的返回值。判据是 ``submitted``；``ok`` 只是旧兼容。
+
+        ``reason`` **必须归一**（S06）：宿主只保证 ``backpressure`` /
+        ``transport_error`` / ``transport_unavailable`` 三个稳定值，
+        白名单外的字符串一律回落 ``transport_error`` —— 否则下游会看到
+        第四个"稳定码"，而它其实是自由文本。
+        """
         if isinstance(result, Mapping):
             if "submitted" in result:
                 submitted = bool(result.get("submitted"))
@@ -1316,9 +1542,7 @@ class CompanionService:
                 submitted = bool(result.get("ok"))
             if submitted:
                 return (True, None)
-            raw = result.get("reason")
-            reason = raw if isinstance(raw, str) and raw else "transport_error"
-            return (False, reason)
+            return (False, _normalize_push_reason(result.get("reason")))
         if isinstance(result, bool):
             return (result, None if result else "transport_error")
         # 拿不到 dict 就无法判断成败：按"没送到"处理，比假装成功安全。
@@ -1345,12 +1569,16 @@ class CompanionService:
             diagnostics["error_context"] = _jsonable_context(exc.context)
 
         # 这里只能同步 push：本方法不是 async，而 _push 里也**没有 await**（push_message 同步）。
+        # 节流（S07）：同一个故障码在同一个消息窗里只推一次 —— 连拍三张都失败时，
+        # 用户看到的应该是"还是不行"，不是同一句话刷三屏。
+        # 注意：**成功路径不去重**（用户就是要连拍），只有这里带 dedupe_key。
         pushed, reason = self._push_sync(
             parts,
             source="arknights_capture",
             visibility=visibility,
             ai_behavior=ai_behavior,
             priority=priority,
+            dedupe_key=f"capture:fail:{error_code or 'unexpected'}",
         )
         user_text = self._join_text(parts)
         diagnostics.update({"pushed": pushed, "reason": reason, "error_code": error_code})
@@ -1379,15 +1607,25 @@ class CompanionService:
         visibility: Sequence[str],
         ai_behavior: str,
         priority: int,
+        dedupe_key: str | None = None,
     ) -> tuple[bool, str | None]:
         """``_push`` 的同步孪生体。
 
         ``push_message`` 本身是同步的，所以"同步路径"不需要 await；
         但两处共用同一套判据（``_interpret_push_result``）——
         否则"成功/失败怎么判"就会有两个真相。
+
+        ``dedupe_key`` 与 :meth:`_push` **共用同一个** ``_last_push_key``：
+        "最近推过什么"只有一个真相，否则状态播报与截图失败会各刷一遍。
+
+        去重语义与 :meth:`_push` **逐条一致**：命中就跳过并返回 ``(False, "deduped")``；
+        **只有 ``submitted=True`` 才更新** ``_last_push_key`` ——
+        一次失败若也写入 key，会把后续同类消息**永久**节流掉（用户再也收不到）。
         """
         if not parts:
             return (False, "empty")
+        if dedupe_key is not None and dedupe_key == self._last_push_key:
+            return (False, "deduped")
         try:
             result = self._push_fn(
                 source=source,
@@ -1399,7 +1637,12 @@ class CompanionService:
         except Exception:  # noqa: BLE001
             logger.warning("push_message raised; treating as transport_error", exc_info=True)
             return (False, "transport_error")
-        return self._interpret_push_result(result)
+        submitted, reason = self._interpret_push_result(result)
+        if submitted:
+            # 与 :meth:`_push` 逐条一致：**成功就写回** ``dedupe_key``（可能是 None，
+            # 那等于"重置节流"—— 故障恢复后再出错应当重新告知用户，不该被旧 key 吞掉）。
+            self._last_push_key = dedupe_key
+        return (submitted, reason)
 
     # ------------------------------------------------------------------
     # 内部：状态/快照
