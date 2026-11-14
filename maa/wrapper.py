@@ -46,6 +46,7 @@ __all__ = [
     "INVALID_ID",
     "PNG_SIGNATURE",
     "MaaPlatform",
+    "AsstInstanceOptionKey",
     "MaaCallStatus",
     "MaaCallError",
     "MaaCoreWrapper",
@@ -77,8 +78,18 @@ PNG_SIGNATURE: Final[bytes] = b"\x89PNG\r\n\x1a\n"
 DEFAULT_MAX_IMAGE_BUFFER_BYTES: Final[int] = 64 * 1024 * 1024
 """单次图片缓冲分配的硬上限（64 MiB）。"""
 
-DEFAULT_MAX_BUFFER_GROW: Final[int] = 2
-"""缓冲区最多倍增几次（默认 2 次，即最多调用 C 侧 1 + 2 次）。"""
+DEFAULT_MAX_BUFFER_GROW: Final[int] = 6
+"""缓冲区最多倍增几次（默认 6 次，即最多调用 C 侧 1 + 6 次）。
+
+**为什么从 2 改成 6**（实测口径，见 W29）：``AsstGetImage`` 出的是 PNG，
+1 MiB 起步时 grow=2 只能长到 4 MiB。1080p 的游戏界面通常够，但**4K（3840×2160）**
+在 HDR / 高对比度画面下 PNG 可以到 8–20 MiB —— 明明 64 MiB 预算还剩很多，
+却先撞"次数上限"报 ``grow_limit_reached``，用户看到的是"截图失败"而不是"缓冲不够"。
+6 次能走 1→2→4→8→16→32→64 MiB，**在字节上限处由 ``no_budget_to_grow`` 收口**，
+不再让次数上限抢先成为真正的天花板。
+
+上限仍是 64 MiB（不是无限放宽）：只有次数上限时，一个畸形大图能让单次分配吃满内存。
+"""
 
 DEFAULT_IMAGE_BUFFER_BYTES: Final[int] = 1 << 20
 """调用方没给 ``buffer_size`` 时的初始缓冲（1 MiB）。
@@ -94,6 +105,24 @@ class MaaPlatform(enum.Enum):
     WINDOWS = "windows"
     DARWIN = "darwin"
     LINUX = "linux"
+
+
+class AsstInstanceOptionKey(enum.IntEnum):
+    """``AsstInstanceOptionKey``（`[FACT]` ``include/AsstTypes.h``）。
+
+    值必须与 C 头文件一致：这是直接传给 ``AsstSetInstanceOption(handle, key, value)``
+    的枚举，写错一位就是**静默改错开关**（C 侧只返回 0，不告诉你哪个 key 不合法）。
+
+    官方 WPF GUI（``AsstProxy.cs``）在建实例后会立刻调这张表里的前三项；
+    我们此前一项都没设，等于把触摸模式、adb-lite、暂停行为全部交给 MaaCore 的
+    内部默认值 —— 这就是"能跑但不是官方那条路"的来源。
+    """
+
+    INVALID = 0
+    TOUCH_MODE = 1                # "minitouch" / "maatouch" / "adb" / "MacPlayTools"
+    DEPLOYMENT_WITH_PAUSE = 2     # "0" / "1"
+    ADB_LITE_ENABLED = 3          # "0" / "1"
+    KILL_ADB_ON_EXIT = 4          # "0" / "1"
 
 
 class MaaCallStatus(enum.Enum):
@@ -164,6 +193,12 @@ GC 时机不可预测，所以这里不设"安全注销点"——一个 CFUNCTYP
 
 名单**只增不减**：超过 100 条时告警一次（提示有泄漏），但绝不截断——
 截断等于重新引入 UAF（`Destroyed` 回调本身还要用到它）。
+
+`[FACT]` 一条名单项的生命周期 = **一个 wrapper 实例**的生命周期，不是"一次调用"
+（A12 用"三轮 connect/cancel 名单不增长"守这条）。因为 CFUNCTYPE 捕获的是绑定方法
+``self._trampoline``，它顺带强引用整个 wrapper，所以名单也是"实例级保活"。正常路径
+一个进程只有一条（``load_library()`` 幂等）；只有"卸载后重新装载"（repair → 重载）
+才会多一条，数量 = 装载次数。
 """
 
 
@@ -219,6 +254,9 @@ class MaaCoreWrapper:
         # 观测字段：``AsstSetConnectionExtras`` 是 void 且解析失败静默 return，
         # 这里只保留"被调用过几次"这个事实，供上层诊断（不解析 JSON）。
         self.connection_extras_calls = 0
+        # ``detach_callback()`` 被调用过几次。与 ``callback_attached`` 分开记：
+        # ``close()`` 也会把目标置空，只有计数能区分"正常关闭"与"超时后主动摘钩子"。
+        self.detach_calls = 0
 
     # --- 平台与库文件（静态，无 IO） ---
     @staticmethod
@@ -285,18 +323,76 @@ class MaaCoreWrapper:
             raise
 
     def close(self) -> None:
-        """仅解除 Python 侧引用并释放 ``_dll_dir_handle``。幂等。
+        """解除 Python 侧引用并释放 ``_dll_dir_handle``。幂等。
 
         动态库无法真正卸载，不做释放承诺。
+        `[FACT]` 这不是"我们懒得卸"：CPython 的 ``ctypes.CDLL`` / ``WinDLL`` **没有**
+        ``__del__``（本机 3.13.14 实测 ``'__del__' in ctypes.CDLL.__dict__`` 为 ``False``），
+        所以丢掉最后一个引用**不会**触发 ``FreeLibrary``/``dlclose`` —— 正在跑的
+        C 线程不会因为我们 ``close()`` 而脚下踩空。反过来说：每次 ``load()`` 的
+        DLL 句柄都活到进程退出（一次性的、有界的内存代价）。
 
         顺序必须是「先放 CDLL 引用，再关 dll_directory 句柄」——反过来会让
         **延迟加载**的依赖（MaaCore 在 ``AsstLoadResource`` 时才 dlopen 的东西）找不到。
 
+        **调用时机是一条硬约束**：不要在"可能还有 ``AsstDestroy`` 在飞"的时候调本方法。
+        ``_lib = None`` 之后线程里那句 ``destroy_instance`` 会在 ``_require_lib()``
+        直接抛 ``MaaCallError``（销毁被静默跳过、C 对象与三条线程一起留给进程退出）。
+        runtime 的销毁路径为此区分了"确认已销毁（可 close）"与"放弃等待（不 close）"。
+
         CFUNCTYPE 不在这里释放：见 ``_CALLBACK_KEEPALIVE``（UAF 防护）。
+        本方法同时也把 Python 侧回调目标置空 —— 正常销毁路径的"摘钩子"就发生在
+        这里（放弃路径走 :meth:`detach_callback`）。
         """
         self._lib = None
         self._callback = None
+        self._callback_target = None
         self._release_dll_dir_handle()
+
+    @property
+    def callback_attached(self) -> bool:
+        """Python 侧回调目标是否还挂着（``detach_callback()`` 之后为 ``False``）。
+
+        存在的理由：UAF 防护**必须可观测**。只写一句 ``detach_callback()`` 而没人能
+        验证它被调用过，等于把一条安全断言交给"读代码的人" —— R20 用它来断言。
+        """
+        return self._callback_target is not None
+
+    def detach_callback(self) -> bool:
+        """把 Python 侧回调目标换成"什么都不做"，**CFUNCTYPE 本身仍被强引用**。
+
+        存在的唯一场景：``AsstDestroy`` 超时、实例被放弃（UAF 风险窗口）。
+        此时 C 侧线程可能还在跑，仍会回调；而它回调进的那块 Python 状态
+        （adapter / event loop / 事件队列）已经被拆掉了。直接 ``close()`` 不够——
+        ``close()`` 只解引用 CDLL，函数指针还在 C 手里。
+
+        两件事必须同时成立才安全：
+
+        ① ``_CALLBACK_KEEPALIVE`` 里的 CFUNCTYPE **不释放** —— 否则 C 调的是野指针，
+           进程直接崩，``try/except`` 接不住（这才是真正的 UAF）；
+        ② Python 目标置空 —— 否则 trampoline 会去碰已销毁的对象（逻辑上的 UAF）。
+
+        本方法只做 ②，因为它假设 ① 恒成立（模块级名单只增不减）。
+
+        `[FACT]` 为什么 ① 真的成立（不是"应该成立"）：CFUNCTYPE 是用
+        ``_CALLBACK_TYPE(self._trampoline)`` 建的，即它捕获了**绑定方法** ——
+        名单里留着的那个对象同时强引用着本 wrapper 实例。于是即使 ``close()`` 把
+        ``self._callback`` 置空，本实例也不会被回收，trampoline 里
+        ``self._callback_target`` 的读取永远指向活对象。真正会导致进程级崩溃的
+        只有"CFUNCTYPE 被 GC"，而那条路被模块级名单堵死了。
+
+        Returns:
+            ``True`` = 这一次真的摘掉了钩子；``False`` = 本来就没挂着（幂等）。
+            返回值是给"超时放弃路径有没有真的生效"做断言的（见
+            ``MaaRuntime.detach_invocations``）—— 安全断言不能只活在注释里。
+
+        幂等；不抛错。
+        """
+        detached = self._callback_target is not None
+        if detached:
+            self.detach_calls += 1
+        self._callback_target = None
+        return detached
 
     def _release_dll_dir_handle(self) -> None:
         handle, self._dll_dir_handle = self._dll_dir_handle, None
@@ -351,6 +447,10 @@ class MaaCoreWrapper:
             ("AsstGetNullSize", ctypes.c_uint64, (), False),
             ("AsstSetConnectionExtras", None, (ctypes.c_char_p, ctypes.c_char_p), False),
             ("AsstSetStaticOption", ctypes.c_ubyte, (ctypes.c_int32, ctypes.c_char_p), False),
+            # 实例选项：``AsstSetInstanceOption(handle, key: AsstInstanceOptionKey, value)``。
+            # key 是枚举（int32），value 是**字符串**（不是 bool）—— C 侧自己 parse。
+            ("AsstSetInstanceOption", ctypes.c_ubyte,
+             (ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p), False),
         )
         for name, restype, argtypes, required in bindings:
             function = getattr(lib, name, None)
@@ -444,6 +544,16 @@ class MaaCoreWrapper:
 
         `[FACT]` 实现是 ``delete handle``，析构函数会 join 三条内部线程，因此
         **可能长时间阻塞**——调用方必须在工作线程里跑并自带超时，本方法不提供超时。
+
+        `[FACT]` ``~Assistant()`` 的**最后一句**是
+        ``m_callback(Destroyed, "{}", m_callback_arg)``：也就是说"Destroyed 回调是从
+        本方法所在的那条线程上发出来的"。这有两个直接后果：
+
+        * 回调**不需要**额外的 msg 线程活着才能到（那三条线程此时已经 join 完了）；
+        * 但"超时放弃"时析构还没走到最后一句，三条线程可能都还在跑并回调进来 ——
+          这正是 ``detach_callback()`` 要挡的那个窗口。
+
+        本方法只能在实例**真正销毁之后**才允许 ``close()``（见 :meth:`close`）。
         """
         if not handle:
             return
@@ -731,6 +841,35 @@ class MaaCoreWrapper:
         if function is None:
             return False
         return bool(function(int(key), _encode_path(value)))
+
+    def set_instance_option(
+        self,
+        handle: AsstHandle,
+        key: AsstInstanceOptionKey | int,
+        value: str,
+    ) -> bool:
+        """``AsstSetInstanceOption(handle, key, value)`` → 是否被接受。
+
+        机械解码，不含策略：**设哪几项、值是什么，由 runtime 决定**。
+
+        三条 C 侧事实决定了这里为什么只能返回 bool：
+
+        * 返回 ``0`` 的原因**不唯一**（句柄空 / key 越界 / value 不被该 key 接受），
+          C 只给一个 ``AsstBool``，没有任何错误码可区分 —— 所以本层不猜，
+          把"哪一项没设上"留给 runtime 记进诊断；
+        * ``value`` 是**字符串**（``"1"`` / ``"minitouch"``），不是 ``bool``：
+          传 Python ``True`` 会被 ``c_char_p`` 拒成 ``TypeError``，比返回 False 更难查；
+        * 符号是**可选**的：老版本 MaaCore 没导出它。缺符号时返回 ``False``
+          而不是抛 ``AttributeError``，这样"引擎版本略旧"不会变成启动失败。
+        """
+        if not handle:
+            return False
+        lib = self._require_lib()
+        function = getattr(lib, "AsstSetInstanceOption", None)
+        if function is None:
+            logger.debug("AsstSetInstanceOption absent; option %s ignored", key)
+            return False
+        return bool(function(handle, int(key), _encode_path(value)))
 
     # --- 内部 ---
     def _require_lib(self) -> Any:

@@ -42,6 +42,7 @@ import ast
 import contextlib
 import importlib
 import inspect
+import json
 import logging
 import re
 import shutil
@@ -1468,6 +1469,479 @@ def test_s13_execute_automation_raises_not_implemented_without_side_effects():
         )
         assert not hasattr(env.service, "last_error"), (
             "service 出现了 last_error 字段：它会被这条路径顺手改写，而它该归插件接线层"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S14 · 资源家族：必须在第一次失败就说清"只支持国服官服"
+# ---------------------------------------------------------------------------
+_RAW_NATIVE_PATTERNS = (
+    re.compile(r"0x[0-9a-fA-F]{6,}"),                 # 指针 / 模块基址
+    re.compile(r"18446744073709551615"),              # AsstSize 无符号哨兵 2**64-1
+    re.compile(r"(?:Windows|Posix)Path\("),           # Path.__repr__ 原文
+)
+
+
+@case("S14", "copy", "resource")
+def test_s14_resource_copy_declares_cn_official_scope():
+    """S14 · 资源家族的文案必须带"只支持国服官服"，且**不泄露路径/原生值**。
+
+    为什么这条是产品需求而不是礼貌：`[FACT]` MaaCore 没有任何 C API 能查"当前连的是
+    哪个客户端"，所以"只支持国服官服"只能是声明；而声明如果不出现在**用户第一次失败**
+    的那条消息里，就等于不存在 —— 外服用户会去反复重启、重下引擎、换端口，全都无效。
+
+    覆盖资源三兄弟（`missing` / `load_rejected` / `instance.create_failed`，同一个根因族），
+    每条都同时断言"有那句话"和"没有机器值"（对齐 S08 的既有纪律）：
+
+      * 路径只允许出现**我们自己刻意给用户看的**那两类：`searched`（§3.5.1 要求列出）
+        与 `engine_root` 占位；`expected_dir` / `resource_parent` / `user_dir` 一律不许进文案；
+      * 原生值（16 进制指针、`2**64-1` 哨兵、`WindowsPath(...)` 的 repr）一律不许出现；
+      * 正反对照：原始值必须仍在 `to_dict()['context']` 里（诊断不能丢）。
+
+    另加一条**反向**断言：非资源家族（如 `AdbDisconnected`）**不得**带这句话 ——
+    否则它变成每条错误都挂的噪声，用户会学会无视它。
+    """
+    S = _svc_mod()
+    E = _errors()
+    problems: list[str] = []
+
+    def _check(exc: Any, *, where: str, allowed: tuple[str, ...] = ()) -> None:
+        parts = S.render_error(exc)
+        text = _joined(parts)
+
+        if "国服" not in text and "官服" not in text:
+            problems.append(
+                f"{where}：文案里没有'只支持国服官服'的声明：{text!r} —— "
+                "外服用户在第一次失败时看不到原因，会去反复重启/重下引擎/换端口"
+            )
+
+        # 路径：只允许刻意保留的那几个字面量
+        blob = text
+        for token in allowed:
+            if token:
+                blob = blob.replace(token, "<allowed>")
+        hits = _paths_in(blob)
+        if hits:
+            problems.append(
+                f"{where}：文案里出现了不该给用户看的绝对路径 {sorted(set(hits))}："
+                f"{text!r}。允许的只有 searched / engine_root 这两类**刻意**保留项"
+            )
+
+        for pattern in _RAW_NATIVE_PATTERNS:
+            hit = pattern.search(text)
+            if hit:
+                problems.append(
+                    f"{where}：文案里出现了原生值 {hit.group(0)!r}：{text!r} —— "
+                    "机器值只能进 to_dict()['context']"
+                )
+        return None
+
+    # 1) resource.missing：expected_dir 不在 searched 里 → 它必须一个字都不露面
+    expected_dir = Path("C:/MAA/resource")
+    searched = (Path("D:/neko/data/maa/resource"), Path("D:/neko/data/maa/bin/resource"))
+    missing = E.ResourceMissing(expected_dir=expected_dir, searched=searched)
+    _check(missing, where="ResourceMissing", allowed=_searched_literals(missing))
+    missing_text = _joined(S.render_error(missing))
+    if "C:/MAA" in missing_text or "C:\\MAA" in missing_text:
+        problems.append(
+            f"ResourceMissing：expected_dir 泄漏进了文案：{missing_text!r} —— "
+            "它不在 searched 里（那是我们真的找过的地方），没有理由给用户看"
+        )
+    context = missing.to_dict()["context"]
+    if str(context.get("expected_dir", "")).replace("/", "\\") != str(expected_dir).replace("/", "\\"):
+        problems.append(f"ResourceMissing：to_dict() 丢了 expected_dir 原文：{context!r}")
+
+    # 2) resource.load_rejected：resource_parent / user_dir 都不许露面
+    rejected = E.ResourceLoadRejected(
+        resource_parent=Path("C:/MAA/resource"),
+        load_ok=False,
+        user_dir_ok=True,
+        user_dir=Path("D:/neko/user"),
+    )
+    _check(rejected, where="ResourceLoadRejected")
+    rejected_text = _joined(S.render_error(rejected))
+    if "C:/MAA" in rejected_text or "C:\\MAA" in rejected_text:
+        problems.append(f"ResourceLoadRejected：资源父目录泄漏进了文案：{rejected_text!r}")
+    if "D:/neko/user" in rejected_text or "D:\\neko\\user" in rejected_text:
+        problems.append(f"ResourceLoadRejected：用户目录泄漏进了文案：{rejected_text!r}")
+    if rejected.to_dict()["context"].get("load_ok") is not False:
+        problems.append("ResourceLoadRejected：to_dict() 丢了 load_ok 原文（正反对照失效）")
+
+    # 3) instance.create_failed（同族，也要有那句声明）
+    create = E.InstanceCreateFailed(resource_loaded=False, library_path=Path("C:/MAA/MaaCore.dll"))
+    _check(create, where="InstanceCreateFailed")
+
+    # 4) 边界：searched 为空 → 仍然要有声明、且不许崩
+    empty = E.ResourceMissing(expected_dir=Path("C:/secret/maa/resource"), searched=())
+    parts = S.render_error(empty)
+    text = _joined(parts)
+    if "国服" not in text and "官服" not in text:
+        problems.append(f"searched 为空时丢了国服声明：{text!r}")
+    if "C:/secret" in text or "C:\\secret" in text:
+        problems.append(f"searched 为空时把 expected_dir 甩出来了：{text!r}")
+    if not text.strip():
+        problems.append("searched 为空时整条文案变成空串（用户什么都看不到）")
+
+    # 5) 错误输入：searched 里混进"用户机器绝对路径"的那一份，属于**刻意保留**项，
+    #    但除此之外仍然一个字都不许多 —— 用 allowed 精确豁免，不做"有路径就放过"。
+    user_path = Path("C:/Users/someone/maa/resource")
+    mixed = E.ResourceMissing(expected_dir=Path("C:/Users/someone/maa/resource"), searched=(user_path,))
+    _check(mixed, where="ResourceMissing(searched 含用户路径)", allowed=_searched_literals(mixed))
+    mixed_text = _joined(S.render_error(mixed))
+    if mixed_text.count("C:\\Users\\someone") != 1 and mixed_text.count("C:/Users/someone") != 1:
+        problems.append(
+            "searched 里的路径出现了次数不对（0 次=用户不知道往哪儿放；>1 次=重复泄漏）："
+            f"{mixed_text!r}"
+        )
+
+    # 6) 反向：非资源家族不许带这句声明
+    for other, where in (
+        (E.AdbDisconnected(address="127.0.0.1:5555", why="refused"), "AdbDisconnected"),
+        (E.CaptureTimeout(timeout_s=8, address="127.0.0.1:5555", call_id=1), "CaptureTimeout"),
+    ):
+        text = _joined(S.render_error(other))
+        if "国服" in text or "官服" in text:
+            problems.append(
+                f"{where} 也带了'只支持国服官服'：{text!r} —— "
+                "这句话只属于资源家族；每条错误都挂一遍，用户会学会无视它"
+            )
+
+    assert not problems, "资源家族文案不合格：\n  " + "\n  ".join(problems)
+
+
+# ---------------------------------------------------------------------------
+# S15 · 用户点重连 ⇒ 必须走强制重连（否则幂等短路会让按钮看起来坏了）
+# ---------------------------------------------------------------------------
+class _ForcedRuntime(_FakeRuntime):
+    """在 ``_FakeRuntime`` 上加可选能力 ``connect_forced``（= 真 runtime 的 `force=True`）。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.forced_calls: list[dict[str, Any]] = []
+
+    async def connect_forced(self, **kwargs: Any) -> Any:
+        self.forced_calls.append(dict(kwargs))
+        if isinstance(self._connect, BaseException):
+            raise self._connect
+        return self._connect
+
+
+def _known_device() -> Any:
+    """一个"分辨率已知"的假 ``DeviceProfile``（只满足 `_resolution_text` 的读法）。"""
+    return types.SimpleNamespace(
+        connected=True,
+        uuid="emu-1",
+        resolution=types.SimpleNamespace(status=_State("known"), width=1920, height=1080),
+    )
+
+
+@case("S15", "reconnect")
+def test_s15_reconnect_uses_forced_capability_and_never_downgrades():
+    """S15 · `handle_reconnect()` 是"用户显式点了重连"，必须优先 `connect_forced()`。
+
+    不改会怎样：设备"假活"时（`READY` 但截图一直超时、且没有 `Disconnect` 事件）会被
+    runtime 的幂等短路折成"什么都没发生"——用户只会认为按钮坏了。
+
+    三段：
+      ① 正常：端口有 `connect_forced` → 走它（`connect` 一次都没调）、
+         `diagnostics['forced'] is True`、结果 ok 且文案带分辨率；
+      ② 边界：默认配置**不下发** `config` / `extras`（窄接口纪律：只传用户真的改过的，
+         否则每个只实现 `address`+`adb_path` 的端口都会炸成 TypeError）；
+         显式配了 MuMu12 + extras 时两者都原样下发；
+      ③ 错误输入：端口**没有**该能力（老实现/替身）→ 退回普通 `connect()` 且
+         `diagnostics['forced'] is False`（能力探测，不是硬依赖）；
+         强制重连抛 `EngineError` → 文案渲染 + push 恰好一次，ok=False。
+    """
+    S = _svc_mod()
+    E = _errors()
+
+    # ① 正常：有 connect_forced 就必须用
+    with _env(
+        runtime=_ForcedRuntime(connect=_known_device()),
+        config={"adb_address": "127.0.0.1:5555", "adb_path": "adb"},
+    ) as env:
+        outcome = asyncio.run(env.service.handle_reconnect())
+        assert outcome.ok is True, f"重连失败了：{outcome.user_text!r}"
+        assert env.runtime.forced_calls, (
+            "有 connect_forced 却走了普通 connect —— 用户点重连时"
+            "（设备假活、无 Disconnect 事件）会被幂等短路成'什么都没发生'"
+        )
+        assert env.runtime.connect_calls == [], (
+            f"同时也调了普通 connect：{env.runtime.connect_calls!r}（一次重连只该发一次号）"
+        )
+        assert outcome.diagnostics.get("forced") is True, (
+            f"diagnostics['forced'] 应是 True，实际 {outcome.diagnostics.get('forced')!r}"
+        )
+        assert "1920" in outcome.user_text and "1080" in outcome.user_text, (
+            f"成功文案没带分辨率（用户无法确认连对设备了）：{outcome.user_text!r}"
+        )
+        assert env.push.count == 1, f"成功也要回一句话（实际 push {env.push.count} 次）"
+
+        # ② 边界：默认配置不下发 config/extras
+        assert env.runtime.forced_calls[0] == {
+            "address": "127.0.0.1:5555",
+            "adb_path": "adb",
+        }, (
+            "默认配置把 config/extras 也下发了："
+            f"{env.runtime.forced_calls[0]!r} —— 那与 runtime 的默认值逐字等价，"
+            "只会让只实现窄接口的端口实现炸成 TypeError"
+        )
+
+    # ② 边界：显式配置 + extras 必须原样下发
+    with _env(
+        runtime=_ForcedRuntime(connect=_known_device()),
+        config={
+            "adb_address": "127.0.0.1:16384",
+            "adb_path": "",
+            "adb_connect_config": "MuMuEmulator12",
+            "adb_connect_extras": '{"path": "D:/MuMuPlayer-12.0"}',
+        },
+    ) as env:
+        outcome = asyncio.run(env.service.handle_reconnect())
+        assert outcome.ok is True, f"重连失败了：{outcome.user_text!r}"
+        sent = env.runtime.forced_calls[0]
+        assert sent.get("config") == "MuMuEmulator12", (
+            f"连接配置没传下去：{sent!r}（MuMu12 写死 General 会'能连但截图慢/不稳'）"
+        )
+        assert sent.get("extras") == {"path": "D:/MuMuPlayer-12.0"}, (
+            f"extras 没被解析成 dict 传下去：{sent.get('extras')!r}"
+        )
+        assert outcome.diagnostics.get("connect_config") == "MuMuEmulator12", (
+            f"诊断里的 connect_config 不对：{outcome.diagnostics!r}"
+        )
+        assert outcome.diagnostics.get("extras_keys") == ["path"], (
+            "诊断只该记 extras 的**键**（值是用户机器上的绝对路径，只进日志）："
+            f"{outcome.diagnostics.get('extras_keys')!r}"
+        )
+
+    # ③ 错误输入 a：端口没有该能力 → 退回普通 connect（能力探测）
+    with _env(
+        runtime=_FakeRuntime(connect=_known_device()),
+        config={"adb_address": "127.0.0.1:5555", "adb_path": ""},
+    ) as env:
+        outcome = asyncio.run(env.service.handle_reconnect())
+        assert outcome.ok is True, f"退回普通 connect 后重连失败了：{outcome.user_text!r}"
+        assert env.runtime.connect_calls, "没有 connect_forced 时也没退回 connect —— 重连彻底失效"
+        assert outcome.diagnostics.get("forced") is False, (
+            "端口不支持强制重连时 diagnostics['forced'] 必须是 False（要可观测），"
+            f"实际 {outcome.diagnostics.get('forced')!r}"
+        )
+
+    # ③ 错误输入 b：强制重连抛 EngineError → 渲染文案 + push 一次
+    with _env(
+        runtime=_ForcedRuntime(connect=E.AdbConnectTimeout(address="127.0.0.1:5555", timeout_s=10)),
+        config={"adb_address": "127.0.0.1:5555", "adb_path": ""},
+    ) as env:
+        outcome = asyncio.run(env.service.handle_reconnect())
+        assert outcome.ok is False, "连接超时却报成功"
+        assert outcome.diagnostics.get("error_code") == "adb.connect_timeout", (
+            f"错误码不对：{outcome.diagnostics!r}"
+        )
+        assert env.push.count == 1, f"失败也要回一句话（实际 push {env.push.count} 次）"
+        assert "10" in outcome.user_text, (
+            f"文案里应带上超时秒数（用户得知道等了多久）：{outcome.user_text!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S16 · connection_extras 进 data 前必须消毒（keys 与 error 都是外部输入）
+# ---------------------------------------------------------------------------
+def _wrapper_mod() -> Any:
+    """`maa/wrapper.py` —— 只为拿**真的** `MaaCallError` / `MaaCallStatus` 造 ``error`` 原文。
+
+    为什么不手写那串文本：``runtime._dispatch_connection_extras`` 写进快照的是
+    ``f"{type(exc).__name__}: {exc}"[:160]``，而 ``MaaCallError.detail`` 里可能有
+    ``library_path``，于是 ``str(exc)`` 会带上 ``WindowsPath('C:/…')`` 的 repr。
+    用例必须从**真异常类**出发，否则断的是一个我们想象出来的形状。
+    """
+    _install_stub_package()
+    try:
+        return importlib.import_module("arknights_neko_plugin.maa.wrapper")
+    except Exception as exc:                      # noqa: BLE001 - 依赖没落盘时如实报阻塞
+        raise R.Blocked(
+            f"无法加载 maa/wrapper.py（{type(exc).__name__}: {exc}）"
+        ) from exc
+
+
+def _extras_error_samples() -> list[tuple[str, str, tuple[str, ...], str]]:
+    """``(label, error 文本, 原始里必须出现的泄漏片段, 必须活下来的诊断词)``。
+
+    两段缺一不可：``MaaCallError`` 带 ``WindowsPath`` repr（真实故障形态），
+    普通异常带 ``D:/Program Files/...``（路径出现在**消息正文**里，不能只靠
+    "detail 的 repr" 那条规则救）。
+    """
+    W = _wrapper_mod()
+    exc = W.MaaCallError(
+        "AsstSetConnectionExtras",
+        W.MaaCallStatus.REJECTED,
+        detail={"library_path": Path("C:/Users/me/MaaCore.dll")},
+    )
+    boom = RuntimeError("open D:/Program Files/X/MuMuPlayer failed")
+    return [
+        (
+            "MaaCallError(detail.library_path)",
+            f"{type(exc).__name__}: {exc}"[:160],
+            ("C:/Users", "MaaCore.dll", "WindowsPath"),
+            "rejected",
+        ),
+        (
+            "RuntimeError(路径在消息正文里)",
+            f"{type(boom).__name__}: {boom}"[:160],
+            ("D:/Program", "Program Files", "MuMuPlayer"),
+            "failed",
+        ),
+    ]
+
+
+def _extras_entry(connection_extras: Any, *, key_present: bool = True) -> dict[str, Any]:
+    """把 ``connection_extras`` 塞进 fake 的 ``status_snapshot()``，跑到 entry 的 ``data``。
+
+    **走真路径**：``handle_status()`` → ``_snapshot()``（消毒在这里）→ ``to_entry_dict()``。
+    不直接调 ``_safe_connection_extras`` 断言，是因为"消毒函数返回什么"不等于
+    "用户/模型最终看到什么" —— 少一步透传就测不到。
+    """
+    snapshot: dict[str, Any] = {"state": "ready", "download_progress": None}
+    if key_present:
+        snapshot["connection_extras"] = connection_extras
+    with _env(runtime=_FakeRuntime(snapshot=snapshot), push=_Pusher()) as env:
+        outcome = asyncio.run(env.service.handle_status())
+        assert outcome.ok is True, f"查状态恒成功，实际 ok=False：{outcome.user_text!r}"
+        data = outcome.to_entry_dict()
+        assert isinstance(data, Mapping), f"entry 载荷不是 Mapping：{data!r}"
+        return dict(data)
+
+
+@case("S16", "copy", "connect-extras")
+def test_s16_connection_extras_are_sanitized_before_entry_data():
+    """S16 · `connection_extras` 进 entry 的 `data` 前必须过消毒，且**不许消毒成"没信息"**。
+
+    为什么这个字段非进 `data` 不可：``[FACT]`` C 侧 ``AsstSetConnectionExtras`` 返回
+    ``void``、JSON 解析失败也只是静默 return —— "配了 MuMu12 却没生效"在用户侧
+    **只有这一个可见证据**。所以它既不能被漏掉，也不能带着绝对路径出去。
+
+    两处都是外部输入，都必须过 `sanitize_maa_text` 的既有口径：
+
+      * ``error``：异常原文，``MaaCallError.detail`` 里可能有 ``library_path``；
+      * ``keys``：键名来自配置（``{"C:\\Users\\me": ...}`` 这种并非不可能）。
+
+    四段 + 一条错误输入：
+      ① 正常透传：成功态原样进 `data`（`dispatched` / `keys` 在），``error=None`` **不塞**；
+      ② ``dispatched=False`` 必须保留 —— "没发出去"这条事实是这个字段存在的**唯一理由**，
+         消毒不许把它、也不许把它的 `error` 原因洗掉；
+      ③ 路径消毒（核心）：`error` 里带 ``C:/Users/me/MaaCore.dll`` 与
+         ``D:/Program Files/X/MuMuPlayer``、`keys` 里塞一个路径型键名 →
+         ``json.dumps(data)`` 里**不得**出现路径片段或 ``WindowsPath`` repr，
+         但 `dispatched` 仍在、键数量不缩水、诊断词活下来；
+      ④ ``None`` 保留：``connection_extras=None`` → `data` 里就是 ``None``
+         （"没配"必须与"配了没发出去"可区分，既不许丢键也不许变 ``{}``）；
+         边界：runtime **没报**这个字段（老实现）→ `data` 里也不许凭空造一个；
+      错误输入：值不是 Mapping（有人在别处塞了字符串/数字）→ 折成 ``None``，不炸。
+    """
+    # ① 正常透传
+    data = _extras_entry({"keys": ["path"], "dispatched": True, "error": None})
+    assert "connection_extras" in data, (
+        f"entry 的 data 里没有 connection_extras：{sorted(data)} —— "
+        "它是'配了 MuMu12 却没生效'在用户侧的唯一证据，漏掉就等于让用户去猜"
+    )
+    ok = data["connection_extras"]
+    assert isinstance(ok, Mapping), f"connection_extras 进 data 后不是 Mapping：{ok!r}"
+    assert ok.get("dispatched") is True, f"成功态的 dispatched 不是 True：{ok!r}"
+    assert list(ok.get("keys") or []) == ["path"], f"成功态丢了键名：{ok!r}"
+    assert "error" not in ok, (
+        f"error=None 时不该强塞一个空 error 字段：{ok!r} —— "
+        "空字段会让'没出错'与'没报上来'看起来一样"
+    )
+
+    # ② dispatched=False + 原因：消毒不许把"没发出去"这条事实洗掉
+    data = _extras_entry(
+        {
+            "keys": ["path"],
+            "dispatched": False,
+            "error": "MaaCallError: AsstSetConnectionExtras -> rejected",
+        }
+    )
+    bad = data["connection_extras"]
+    assert bad.get("dispatched") is False, (
+        f"dispatched=False 被消毒掉了（实际 {bad.get('dispatched')!r}）—— "
+        "'没发出去'这条事实是这个字段存在的唯一理由"
+    )
+    assert bad.get("error"), f"error 被整段丢掉 = 把泄漏换成了失明：{bad!r}"
+    assert "rejected" in str(bad.get("error")), (
+        f"消毒把诊断词一起吞了（消毒 ≠ 整段丢弃）：{bad.get('error')!r}"
+    )
+
+    # ③ 路径消毒（核心）
+    path_key = "C:\\Users\\me"                     # 键名来自配置：路径型键名并非不可能
+    for label, error_text, leaks, keep in _extras_error_samples():
+        raw = {"keys": ["path", path_key], "dispatched": False, "error": error_text}
+
+        # 反证：原始文本里**确实**有这些片段 —— 否则下面"没泄露"是空断言
+        raw_blob = json.dumps(raw, ensure_ascii=False)
+        for leak in leaks:
+            assert leak in raw_blob, (
+                f"[{label}] 反证失败：样本里本来就没有 {leak!r}，这条断言测不到东西：{raw_blob}"
+            )
+
+        data = _extras_entry(raw)
+        blob = json.dumps(data, ensure_ascii=False)
+        got = data["connection_extras"]
+
+        # (a) **形态检查**：直接扫原始 str，不靠 JSON 转义。
+        #     踩过的坑：`json.dumps` 会把 `\` 转成 `\\`，拿裸 `"C:\\Users" in blob`
+        #     去断"路径没泄漏"是**假绿**（实测：keys 完全没消毒时它照样不命中）。
+        for where, text in (
+            ("keys", " | ".join(str(key) for key in (got.get("keys") or []))),
+            ("error", str(got.get("error") or "")),
+        ):
+            hits = _paths_in(text)
+            assert not hits, (
+                f"[{label}] {where} 里还有绝对路径 {sorted(set(hits))}：{text!r} —— "
+                "keys 与 error 都是外部输入，进 data 前必须过 sanitize_maa_text"
+            )
+        # (b) 与转义无关的路径片段（值本身、库名、repr 类名）
+        for leak in (".dll", "MaaCore", "MuMuPlayer", "WindowsPath", "Program Files"):
+            assert leak not in blob, (
+                f"[{label}] data 里泄漏了路径片段 {leak!r}：{blob} —— "
+                "keys 与 error 都是外部输入，进 data 前必须过 sanitize_maa_text"
+            )
+        assert got.get("dispatched") is False, (
+            f"[{label}] 消毒把 dispatched 也一起丢了：{got!r}"
+        )
+        keys = list(got.get("keys") or [])
+        assert len(keys) == 2, (
+            f"[{label}] 键数量缩水（{len(keys)} != 2）：{keys!r} —— "
+            "折叠路径不等于删掉这一项，用户还要知道'一共配了几项'"
+        )
+        assert keys[0] == "path", f"[{label}] 普通键名被洗掉了：{keys!r}"
+        assert keep in str(got.get("error") or ""), (
+            f"[{label}] 诊断词 {keep!r} 被吞了（消毒 ≠ 整段丢弃）：{got.get('error')!r}"
+        )
+
+    # ④ None 保留（"没配"必须可与"配了没发出去"区分）
+    data = _extras_entry(None)
+    assert "connection_extras" in data, (
+        f"connection_extras=None 时这个键被整个丢掉了：{sorted(data)} —— "
+        "丢键就变成'不知道'，用户无法排除'是不是根本没配'"
+    )
+    assert data["connection_extras"] is None, (
+        f"None 被换成了 {data['connection_extras']!r} —— "
+        "`{}` 会让'没配'与'配了但没发出去'看起来一样"
+    )
+
+    # ④ 边界：runtime 没报这个字段（老实现）→ data 里也不许凭空造一个 None
+    data = _extras_entry(None, key_present=False)
+    assert "connection_extras" not in data, (
+        f"runtime 根本没报这个字段，service 却塞了一个 {data.get('connection_extras')!r} —— "
+        "凭空造一个 None 会让'老 runtime 不支持'与'这次没配'看起来一样"
+    )
+
+    # 错误输入：值不是 Mapping → 按"没有信息"折成 None（不炸、不透传）
+    for weird in ("oops", 42, ["path"]):
+        data = _extras_entry(weird)
+        assert data.get("connection_extras") is None, (
+            f"非 Mapping 的 connection_extras（{weird!r}）没有被折成 None："
+            f"{data.get('connection_extras')!r} —— 形状不对说明有人在别处塞了东西，"
+            "按'没有信息'处理比原样透传安全"
         )
 
 

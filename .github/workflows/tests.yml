@@ -1,0 +1,39 @@
+# 本仓库自有测试门禁。**不属于** plugin-market-actions-v1 模板（不是生成文件）：
+# 上游 `plugin-market-verify.yml` 只做 ruff + 依赖 sync + `neko_plugin_cli check` +
+# 打包取证，**不执行本仓库的 tests/**（已逐 step 核对），所以"契约用例全绿"这件事
+# 在 CI 里没有别人守。独立成文件是为了不被市场工具重新生成时覆盖。
+name: Tests
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    name: 本仓库零依赖测试（contract + service）
+    runs-on: windows-latest
+    # 两套用例本机合计约 15s；给 20 分钟是为了"卡住时变红，而不是挂满 6 小时"。
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 与真机宿主保持同一小版本线；用例不依赖任何第三方包（零依赖设计）。
+          python-version: "3.13"
+
+      - name: 打印解释器版本（失败时用于对账）
+        run: python -VV
+
+      - name: 契约测试 tests/test_contract.py
+        # 退出码语义（tests/_runner.py）：0 全绿 / 1 有失败 / 2 收集期不一致 /
+        # 3 有未实现或被阻塞。三种非零都算红 —— "没跑到"不能算通过。
+        #
+        # 路径假设：两个用例文件都用 `Path(__file__).resolve()` 引导 sys.path
+        # （见 test_contract.py::_bootstrap_path），与 cwd 无关；这里按 Actions
+        # 默认 cwd（= GITHUB_WORKSPACE = 仓库根）写相对路径即可。
+        run: python tests/test_contract.py
+
+      - name: 服务层测试 tests/test_service.py
+        run: python tests/test_service.py

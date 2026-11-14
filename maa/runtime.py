@@ -31,14 +31,14 @@ import shutil
 import struct
 import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final
 
-from .adapter import DeviceProfile, MaaAdapter, Resolution
+from .adapter import DeviceProfile, LinkState, MaaAdapter, Resolution
 from .errors import (
     AdbDisconnected,
     CaptureTimeout,
@@ -64,7 +64,14 @@ from .provision import (
     safe_extract,
     verify_sha256,
 )
-from .wrapper import AsstHandle, MaaCallError, MaaCoreWrapper, MaaPlatform
+from .wrapper import (
+    DEFAULT_MAX_BUFFER_GROW,
+    AsstHandle,
+    AsstInstanceOptionKey,
+    MaaCallError,
+    MaaCoreWrapper,
+    MaaPlatform,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +81,61 @@ __all__ = [
     "HealthSnapshot",
     "ProvisionPorts",
     "MaaRuntime",
+    "DEFAULT_INSTANCE_OPTIONS",
+    "SUPPORTED_CLIENT_SCOPE",
 ]
 
 _MARKER_NAME: Final[str] = "engine.json"
+
+DEFAULT_INSTANCE_OPTIONS: Final[Mapping[str, str]] = {
+    "TouchMode": "minitouch",
+    "AdbLiteEnabled": "1",
+    "DeploymentWithPause": "0",
+}
+"""建实例后要立刻设置的选项（官方 GUI 也设这三项），**值是字符串**。
+
+三条取值理由，改动前请先读：
+
+* ``TouchMode = minitouch``：MAA 各平台的默认就是它，也是官方 GUI 的出厂值。
+  ``maatouch`` 更快但要把一个可执行文件推进 ``/data/local/tmp``（属于"在设备上落地文件"，
+  超出本插件"只读浏览"的边界）；``adb`` 模式每帧都走 ``adb exec-out``，截图最慢。
+* ``AdbLiteEnabled = 1``：**截图稳定性相关**。关掉时 MAA 每次截图都要重连一次 adb，
+  连拍场景（我们这个插件就是连拍）会明显抖；打开后复用连接。
+  个别模拟器对这个模式兼容性差 —— 这时用 ``instance_options`` 覆盖成 ``"0"``，
+  而不是改这里的默认值（默认值要对大多数人是对的）。
+* ``DeploymentWithPause = 0``：本插件**不部署**，这一项只影响"暂停时是否自动部署"；
+  显式写 0 是为了防止某天有人在别处把它打开，让一个只读插件开始动手。
+
+不存在"引擎自动探测最优值"这回事：C API 只接受调用方给的字符串。
+"""
+
+INSTANCE_OPTION_KEYS: Final[Mapping[str, AsstInstanceOptionKey]] = {
+    "TouchMode": AsstInstanceOptionKey.TOUCH_MODE,
+    "DeploymentWithPause": AsstInstanceOptionKey.DEPLOYMENT_WITH_PAUSE,
+    "AdbLiteEnabled": AsstInstanceOptionKey.ADB_LITE_ENABLED,
+}
+"""选项名 → C 枚举。名字用**可读名**而不是枚举值，是为了让日志/诊断能自解释。"""
+
+SUPPORTED_CLIENT_SCOPE: Final[str] = "cn-official"
+"""本插件**只支持国服官服**（官服 = 鹰角官方客户端；国服 = 中国大陆区服）。
+
+为什么是"声明"而不是"检测"：MaaCore **没有任何 C API 能查询当前连接的客户端类型**
+（客户端类型是识别阶段模板匹配出来的内部状态，``AsstGetImage`` / ``AsstConnected``
+都给不出来）。所以这里不写"检测到外服就抛异常"这种看着很聪明、实际永远不会触发的
+代码 —— 那正是上一轮刚清理掉的"死代码假绿"。
+
+真正的防线放在两处：
+
+* **声明**：这个常量进 ``status_snapshot()['client_scope']``，用户报障时一眼能看到
+  "我们本来就没打算支持外服"，而不是去猜"为什么识别不准"；
+* **文案**：``resource.*`` 一类失败的 hint 里明确写"只支持国服官服"，
+  让外服用户**在第一次失败时**就知道原因，而不是反复重启。
+
+为什么不做多资源（``cache`` 增量 / ``global`` 外服）：MAA 的 ``AsstLoadResource``
+只接受"包含 ``resource`` 的那一层"，没有按子集加载的 API；要支持多客户端就得
+同时分发多份模板（体积翻倍），而我们**一个国服都还没在真机上验过**。
+按 ``docs/03-engine-provisioning.md`` 的原则：先锁一个范围把它做对。
+"""
 
 
 class EngineState(enum.Enum):
@@ -262,12 +321,13 @@ class MaaRuntime:
         provision_ports: "ProvisionPorts | None" = None,
         wrapper_factory: Callable[..., MaaCoreWrapper] | None = None,
         max_image_buffer_bytes: int = 64 * 1024 * 1024,
-        max_buffer_grow: int = 2,
+        max_buffer_grow: int = DEFAULT_MAX_BUFFER_GROW,
         connect_timeout: float = 10.0,
         capture_timeout: float = 8.0,
         resolution_grace: float = 2.0,
         load_timeout: float = 20.0,
         destroy_timeout: float = 5.0,
+        instance_options: Mapping[str, str] | None = None,
     ) -> None:
         self._engine_root = Path(engine_root)
         self._user_dir = Path(user_dir)
@@ -286,6 +346,20 @@ class MaaRuntime:
         self._load_timeout = float(load_timeout)
         self._destroy_timeout = float(destroy_timeout)
 
+        # 实例选项：**在默认值上覆盖**，不是"给了就用给的"。
+        # 只给 AdbLiteEnabled 一个值时，TouchMode 仍要有值 —— 否则等于把其余开关
+        # 交回给 MaaCore 的内部默认，而"部分设置"比"完全不设置"更难排查。
+        merged: dict[str, str] = dict(DEFAULT_INSTANCE_OPTIONS)
+        if instance_options:
+            for name, value in instance_options.items():
+                if name not in INSTANCE_OPTION_KEYS:
+                    logger.warning("unknown instance option %r ignored", name)
+                    continue
+                merged[name] = str(value)
+        self._instance_options: dict[str, str] = merged
+        self._applied_options: dict[str, str] = {}
+        self._rejected_options: dict[str, str] = {}
+
         self._state = EngineState.ABSENT
         self._last_error: EngineError | None = None
         self._progress: int | None = None
@@ -300,6 +374,33 @@ class MaaRuntime:
         self._device: DeviceProfile | None = None
         self._address = ""
         self._adb_path = ""
+        self._connect_config = "General"
+        # --- 销毁路径的可观测面（不参与任何业务判断，只为了让"有没有真的拆干净"
+        #     在测试/真机复盘里能被断言，而不是靠读日志） ---
+        self._teardown_in_progress = False
+        self._stop_calls = 0            # 真的发出过几次 AsstStop
+        self._destroy_calls = 0         # 真的发过几次销毁线程（=0 表示从未建实例）
+        self._destroy_abandoned = 0     # 放弃等待的次数（>0 就是"已知会崩的窗口"）
+        self._detach_invocations = 0    # 主动摘钩子成功了几次（仅放弃路径会 >0）
+        # 被放弃的实例：**唯一**被允许的有界泄漏。保活它不只是"方便诊断"——
+        # C 线程可能还在里面跑，解引用 wrapper 会让 `_lib` / `add_dll_directory`
+        # 句柄提前消失（见 destroy() 的不变量）。
+        self._abandoned_wrappers: list[MaaCoreWrapper] = []
+        # 上一次**成功**连接用的全部参数（address / adb_path / config / extras）。
+        # 只在 READY 时用来做幂等短路：参数一模一样就没必要重连（见 _connect_serialized）。
+        # 存参数而不是存"连过了"这个布尔，是因为"用户显式换了设备/配置"必须能重连。
+        self._connected_params: (
+            tuple[str, str, str, tuple[tuple[str, str], ...]] | None
+        ) = None
+        # 上一次真连时 extras 的**下发结果**（None = 没配 extras）。
+        # 形状：{"keys": tuple[str, ...], "dispatched": bool, "error": str | None}。
+        # 只记键名不记值；写进 status_snapshot()['connection_extras']，见 _dispatch_connection_extras。
+        self._extras_status: dict[str, Any] | None = None
+        # 连接互斥：``adapter.connect()`` 的第一件事是 ``_reset_session()``，
+        # 两个 Connect 并发时后一个会把前一个正在等的分辨率/uuid 清掉（"冲掉状态"）。
+        # 锁放在 runtime 而不是 adapter：adapter 的调用方只有这里，
+        # 而锁跨"发号 → 等回调 → 等分辨率"三段，属于会话级，不是单次 C 调用级。
+        self._connect_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # 只读快照
@@ -316,6 +417,34 @@ class MaaRuntime:
     @property
     def adapter(self) -> MaaAdapter | None:
         return self._adapter
+
+    @property
+    def lifecycle_stats(self) -> dict[str, int]:
+        """销毁路径的计数器。**只读、纯整数、可直接断言**。
+
+        为什么把它们做成公开属性而不是只写日志：``on_shutdown`` 是宿主最后调用的
+        那个钩子，事后没人能再问 ``wrapper.callback_attached``（那时 wrapper 已经是
+        ``None``）。"超时放弃后到底有没有摘钩子"这条安全断言必须能在**销毁之后**
+        查到，否则它就只是一句注释。
+
+        键的含义：
+
+        * ``stop_calls`` / ``destroy_calls``：真的发出去的 C 调用次数。重复关机的
+          正确表现是**各为 1**（不是 2、3），这是幂等性的可断言形式；
+        * ``destroy_abandoned``：放弃等待的次数，``> 0`` 就是那个"已知会崩的窗口"；
+        * ``detach_invocations``：成功摘钩子的次数，正常路径恒为 0
+          （正常路径由 ``wrapper.close()`` 摘，那条路不算"主动摘钩子"）；
+        * ``abandoned_wrappers``：被保活的 wrapper 个数，应与 ``destroy_abandoned`` 相等；
+        * ``teardown_in_progress``：当前是否正有一次销毁在跑（并发重入的保护标志）。
+        """
+        return {
+            "stop_calls": self._stop_calls,
+            "destroy_calls": self._destroy_calls,
+            "destroy_abandoned": self._destroy_abandoned,
+            "detach_invocations": self._detach_invocations,
+            "abandoned_wrappers": len(self._abandoned_wrappers),
+            "teardown_in_progress": int(self._teardown_in_progress),
+        }
 
     @property
     def layout(self) -> RuntimeLayout:
@@ -340,11 +469,14 @@ class MaaRuntime:
         return self._progress
 
     def health(self) -> HealthSnapshot:
+        # 惰性收敛：断线后不该继续报 READY（理由见 _converge_link_state）。
+        self._converge_link_state()
         layout = self.layout
         error = self._last_error
+        adapter = self._adapter
         stats: dict[str, int] = {}
-        if self._adapter is not None:
-            snapshot = self._adapter.stats()
+        if adapter is not None:
+            snapshot = adapter.stats()
             stats = {
                 "events_received": snapshot.events_received,
                 "events_dropped_late": snapshot.events_dropped_late,
@@ -353,9 +485,13 @@ class MaaRuntime:
                 "loop_binds": snapshot.loop_binds,
                 "resolution_events": snapshot.resolution_events,
             }
+        # ``connected`` 不许和链路事实打架：``AsstConnected`` 是 C 侧探针，掉线瞬间
+        # 它可能还返回 true（controller 对象还在）。链路已断就是 false —— 这条判据的
+        # 语义是"现在能不能用"，不是"对象还在不在"。
+        link_down = adapter is not None and adapter.link_state is LinkState.DISCONNECTED
         return HealthSnapshot(
             state=self._state,
-            connected=bool(self._adapter and self._adapter.is_healthy()),
+            connected=bool(adapter is not None and not link_down and adapter.is_healthy()),
             version=self._wrapper.version if self._wrapper is not None else "",
             library_path=str(layout.library_path) if layout.library_path else None,
             resource_parent=str(layout.resource_parent) if layout.resource_parent else None,
@@ -370,6 +506,9 @@ class MaaRuntime:
 
     def status_snapshot(self) -> dict[str, Any]:
         """给 entry 的完整诊断（结构化字段，不含文案）。"""
+        # 与 health() 同一个收敛点：status 是用户第一个会看的地方，
+        # 断线后它必须显示 loaded + link_state=disconnected，而不是"一切就绪"。
+        self._converge_link_state()
         layout = self.layout
         return {
             "state": self._state.value,
@@ -380,6 +519,22 @@ class MaaRuntime:
             "searched": [str(path) for path in layout.searched],
             "release_version": self._release.version if self._release is not None else None,
             "download_progress": self.download_progress,
+            # 客户端范围是**声明**，不是检测结果（见 SUPPORTED_CLIENT_SCOPE）：
+            # 写进诊断是为了让"识别不准"的报障能第一时间排除"外服"这个变量。
+            "client_scope": SUPPORTED_CLIENT_SCOPE,
+            "connect_config": self._connect_config,
+            "link_state": (
+                self._adapter.link_state.value if self._adapter is not None else "unknown"
+            ),
+            "instance_options": {
+                "requested": dict(self._instance_options),
+                "applied": dict(self._applied_options),
+                "rejected": dict(self._rejected_options),
+            },
+            # None = 这次连接没配 extras；否则 {"keys", "dispatched", "error"}。
+            # dispatched=True 只表示"调用发出去了"（C 侧是 void + 静默 return），
+            # 不代表 MaaCore 解析成功 —— 字段名刻意不叫 applied。
+            "connection_extras": self._extras_snapshot(),
             "error": self._last_error.to_dict() if self._last_error is not None else None,
             "device": None if self._device is None else {
                 "connected": self._device.connected,
@@ -496,10 +651,17 @@ class MaaRuntime:
 
         Raises:
             EngineNotReady: ``state`` 未到 READY
-            AdbDisconnected: 状态说 READY 但 ``is_connected()`` 已为假
+            AdbDisconnected: 状态说 READY 但链路已断（``Disconnect`` 事件）或
+                ``is_connected()`` 已为假
             EngineLoadFailed: 库根本没加载成功（state 停在 FAILED）
         """
         if self._state is EngineState.READY:
+            # 先收敛链路事实：DISCONNECTED 时立刻用**真实原因**失败，
+            # 而不是让调用方先去等满 capture_timeout（那会报成"截图卡住"，
+            # 把"掉线"这个真因藏起来）。
+            link_down = self._converge_link_state()
+            if link_down is not None:
+                raise link_down
             if not self._is_connected():
                 self._set_state(EngineState.LOADED)
                 raise AdbDisconnected(
@@ -794,6 +956,10 @@ class MaaRuntime:
                 resource_loaded=self._resource_loaded,
                 library_path=self.layout.library_path,
             )
+        # 官方 GUI 的下一步就是设实例选项（``AsstProxy.cs``：Create → SetInstanceOption
+        # → Connect）。**必须在 Connect 之前**：TouchMode 是连接/截图时才被 controller
+        # 读走的，连完再设等于这一会话白设。
+        self._apply_instance_options(handle)
         adapter = MaaAdapter(
             wrapper=wrapper,
             handle=handle,
@@ -805,6 +971,38 @@ class MaaRuntime:
         self._adapter = adapter
         self._set_state(EngineState.LOADED)
         return handle
+
+    def _apply_instance_options(self, handle: AsstHandle) -> dict[str, str]:
+        """逐项设实例选项，返回**被接受**的那些。失败的记进诊断，不阻断装载。
+
+        为什么不因为设不上就抛错：这些是"体验调节项"，不是"能不能跑"的前提。
+        真正的后果是截图变慢或触摸退化，那属于降级，不是装载失败 ——
+        而把一个可用的引擎因为"某项开关不被这个版本支持"判死，才是真正的坏决定。
+
+        也不逐项``raise``：C 侧对"句柄空 / key 越界 / value 不被接受"统一返回 0，
+        没有任何区分手段，编造原因就等于撒谎。这里只如实记"哪项没设上"。
+        """
+        wrapper = self._require_wrapper()
+        applied: dict[str, str] = {}
+        rejected: dict[str, str] = {}
+        for name, value in self._instance_options.items():
+            key = INSTANCE_OPTION_KEYS[name]
+            try:
+                ok = wrapper.set_instance_option(handle, key, value)
+            except MaaCallError:
+                logger.debug("set_instance_option(%s=%s) raised", name, value, exc_info=True)
+                ok = False
+            except Exception:  # noqa: BLE001 - 选项是体验项，任何异常都降级为"没设上"
+                logger.debug("set_instance_option(%s=%s) failed", name, value, exc_info=True)
+                ok = False
+            if ok:
+                applied[name] = value
+            else:
+                rejected[name] = value
+                logger.debug("instance option not applied: %s=%s", name, value)
+        self._applied_options = applied
+        self._rejected_options = rejected
+        return applied
 
     async def _load_engine(self) -> None:
         """``UNPACKED → LOADED`` 的三步，整体带超时。**边界捕获，不改异常类型。**"""
@@ -849,12 +1047,90 @@ class MaaRuntime:
     # ------------------------------------------------------------------
     # 阶段 5：连接
     # ------------------------------------------------------------------
-    async def connect(self, *, address: str, adb_path: str = "") -> DeviceProfile:
+    async def connect(
+        self,
+        *,
+        address: str,
+        adb_path: str = "",
+        config: str = "General",
+        extras: Mapping[str, str] | None = None,
+        force: bool = False,
+    ) -> DeviceProfile:
         """连接设备。成功 ``LOADED/READY → READY``；失败**留在 LOADED**（可重试）。
+
+        Args:
+            address: ``host:port``。空串直接 ``AdbAddressMissing``（adapter 判）。
+            adb_path: adb 可执行文件路径；空串表示"用 MAA 自带的推断"。
+            config: **连接配置名**，原样传给 ``AsstAsyncConnect`` 的第 4 个参数。
+                官方的取值是 ``General`` / ``MuMuEmulator12`` / ``LDPlayer`` /
+                ``BlueStacks`` / ``Nox`` / ``MEmu`` / ``Waydroid`` 等 ——
+                不同模拟器要走的连接参数完全不同，写死 ``General`` 会让
+                MuMu12 这类必须走 extras 的模拟器"能连但截图慢/不稳"。
+            extras: 某个 config 需要的额外参数（如 ``{"path": "...\\MuMuPlayer-12.0"}``）。
+                非空时先 ``AsstSetConnectionExtras(config, json)`` 再连 ——
+                **顺序不能反**：C 侧是在 ``connect`` 里读这张表的，连完再设等于没设。
+            force: **只影响"是否复用已有会话"，不影响任何校验**（见下）。``True`` 时
+                跳过幂等短路、无条件真重连（仍走互斥锁、仍由 adapter 重置会话）。
+                用于"用户显式点了重连"这种场景：设备可能"假活"（``READY`` 但截图一直
+                超时、没有 ``Disconnect`` 事件），这时短路会让按钮看起来没反应。
+
+        ``config`` / ``extras`` 必须是**调用方传进来的**，不能在这里根据
+        address 猜模拟器：端口 16384 既可能是 MuMu 也可能是别人转发的，
+        猜错比不猜更糟（会静默走错连接路径，表现成"偶发截图失败"）。
+
+        **幂等**：已经在 ``READY``、且这次请求的四个参数与上次成功连接**完全一致**时，
+        直接返回缓存下来的 :class:`DeviceProfile`，不发任何 C 调用、不重置会话
+        （细节与理由见 :meth:`_connect_serialized`）。参数变了 = 用户要换设备，正常重连。
+        ``force=True`` 是唯一"明知参数没变也要重连"的入口 —— 它**不放松**任何前置校验：
+        状态不对照样 ``EngineNotReady``、地址为空照样 ``AdbAddressMissing``、并发照样排队。
 
         Raises:
             AdbAddressMissing, AdbConnectTimeout, AdbDisconnected, EngineNotReady
         """
+        # 互斥：并发 Connect 会让后一个的 ``_reset_session()`` 把前一个正在等的
+        # 分辨率/uuid 清空（状态被冲掉，然后两个一起超时）。
+        async with self._connect_lock:
+            return await self._connect_serialized(
+                address=address,
+                adb_path=adb_path,
+                config=config,
+                extras=extras,
+                force=force,
+            )
+
+    async def connect_forced(
+        self,
+        *,
+        address: str,
+        adb_path: str = "",
+        config: str = "General",
+        extras: Mapping[str, str] | None = None,
+    ) -> DeviceProfile:
+        """``connect(..., force=True)`` 的**可选**入口，供上层"显式重连"用。
+
+        为什么要多一个方法而不是把 ``force`` 塞进 ``RuntimePort.connect``：
+        业务层的窄接口（``companion/service.py::RuntimePort``）故意只有
+        ``address`` / ``adb_path``（+ 两个可选连接参数），给它加形参会让每一个只实现
+        窄接口的端口实现（含用例替身）收到不认识的 keyword，把"用户没配"变成
+        ``TypeError``。所以可选能力走**能力探测**（``getattr(port, "connect_forced", None)``，
+        与 ``handle_engine_repair`` 探测 ``purge`` 同一套写法）：有就强制重连，没有就退回
+        普通 ``connect()``（老实现/替身的行为不变）。
+        """
+        return await self.connect(
+            address=address, adb_path=adb_path, config=config, extras=extras, force=True
+        )
+
+    async def _connect_serialized(
+        self,
+        *,
+        address: str,
+        adb_path: str,
+        config: str,
+        extras: Mapping[str, str] | None,
+        force: bool,
+    ) -> DeviceProfile:
+        # 状态检查在锁**内部**：排队期间状态可能已经变了（比如被另一个 Connect
+        # 推到了 READY），此时应当按最新状态判，而不是拿进锁前的旧快照。
         if self._state not in (EngineState.LOADED, EngineState.READY):
             raise EngineNotReady(
                 state=self._state.value,
@@ -865,38 +1141,271 @@ class MaaRuntime:
         if adapter is None:
             raise EngineNotReady(state=self._state.value, required=("adapter",))
 
+        request = _connect_request(
+            address=address, adb_path=adb_path, config=config, extras=extras
+        )
+        if force:
+            # 用户显式要求重连：不做任何启发式判断，直接重建会话。
+            logger.debug("forced connect: skipping session reuse (address=%s)", address)
+        else:
+            reused = self._reuse_session(request, adapter)
+            if reused is not None:
+                return reused
+
         self._address = address
         self._adb_path = adb_path
+        self._connect_config = config
+
+        # 每次**真连**都重置 extras 可观测状态：换了 address/config 之后不能还留着
+        # 上一次的 dispatched=True（那等于告诉用户"这次也发出去了"，而这次根本没有）。
+        # 短路路径（上面 _reuse_session 命中）不重置 —— 会话没变，上一次的事实仍然成立。
+        self._extras_status = None
+        if extras:
+            self._dispatch_connection_extras(config, extras)
+
         try:
-            profile = await adapter.connect(address=address, adb_path=adb_path)
+            profile = await adapter.connect(address=address, adb_path=adb_path, config=config)
         except (AdbDisconnected, CaptureTimeout) as exc:
             self._last_error = exc
+            self._drop_session()
             if self._state is EngineState.READY:
                 self._set_state(EngineState.LOADED)
             raise
         except EngineError as exc:
             self._last_error = exc
+            self._drop_session()
             raise
         self._device = profile
+        self._connected_params = request
         self._set_state(EngineState.READY)
         return profile
 
+    def _dispatch_connection_extras(self, config: str, extras: Mapping[str, str]) -> None:
+        """下发 ``AsstSetConnectionExtras``，并把**发没发出去**记进 ``_extras_status``。
+
+        为什么非记不可：``[FACT]`` C 侧 ``AsstSetConnectionExtras`` 返回 ``void``，
+        JSON 解析失败也只是**静默 return** —— 也就是说"配了 extras 却没生效"这件事，
+        C 永远不会告诉我们。上一版用 ``contextlib.suppress(Exception)`` 把 Python 侧
+        的失败也一起吞了，结果用户配了 MuMu12 的安装目录而 extras 根本没发出去时，
+        状态页一片正常，只能靠"截图有点慢"去猜。现在三态可分：
+
+        * ``None``（字段不写）= 这次连接**没配** extras；
+        * ``dispatched=True`` = 调用**发出去了**；
+        * ``dispatched=False`` + ``error`` = Python 侧就失败了（符号缺失/库未加载/编码失败）。
+
+        **``dispatched=True`` 只证明"调用发出去了"，不证明 C 侧解析成功** —— 这条必须
+        写在字段旁边，否则下一个人会把它读成"extras 已生效"，而 C 侧没有任何回执。
+
+        **只记键名，绝不记值**：值通常是 ``D:/Program Files/...`` 这种绝对路径，
+        S08 的纪律对诊断字段同样适用（服务层出口还会再过一遍消毒）。
+        """
+        status: dict[str, Any] = {
+            "keys": tuple(sorted(str(key) for key in extras)),
+            "dispatched": False,
+            "error": None,
+        }
+        self._extras_status = status
+        try:
+            self._require_wrapper().set_connection_extras(
+                config, json.dumps(dict(extras), ensure_ascii=False)
+            )
+        except Exception as exc:  # noqa: BLE001 - 体验项：失败只降级 + 记录，不阻断连接
+            # 截断是防呆：MaaCallError 的 detail 可能带 library_path（绝对路径），
+            # 全量原文只进日志，进 snapshot 的这 160 字由服务层再消毒一遍。
+            status["error"] = f"{type(exc).__name__}: {exc}"[:160]
+            logger.warning(
+                "connection extras NOT dispatched (config=%s, keys=%s): %s: %s",
+                config,
+                ",".join(status["keys"]),
+                type(exc).__name__,
+                exc,
+            )
+            return
+        status["dispatched"] = True
+        logger.debug(
+            "connection extras dispatched (config=%s, keys=%s)", config, status["keys"]
+        )
+
+    def _extras_snapshot(self) -> dict[str, Any] | None:
+        """``_extras_status`` 的只读快照（``None`` = 这次连接没配 extras）。"""
+        status = self._extras_status
+        if status is None:
+            return None
+        return {
+            "keys": list(status["keys"]),
+            "dispatched": bool(status["dispatched"]),
+            "error": status["error"],
+        }
+
+    def _reuse_session(
+        self,
+        request: tuple[str, str, str, tuple[tuple[str, str], ...]],
+        adapter: MaaAdapter,
+    ) -> DeviceProfile | None:
+        """``READY`` + 参数完全一致 → 返回已缓存的 profile（**幂等短路**），否则 ``None``。
+
+        不改会怎样：``adapter.connect()`` 的第一件事是 ``_reset_session()``，它会把
+        分辨率 / uuid / 链路状态全部清空。也就是说"再点一次重连"（或任何重试逻辑）
+        都会把一个**已经建好、已经拿到分辨率**的会话拆掉重建；网络慢一点就表现为
+        "本来好的，点了重连反而没分辨率了"。
+
+        三条边界（每条都对应一个真实需求）：
+
+        * **参数变了必须真重连**：address / adb_path / config / extras 任一项不同，
+          都是用户显式要求换设备或换连接路径，短路等于无视他的修改；
+        * **非 ``READY`` 不短路**：``LOADED`` 的意思是"还没连上"，此刻手里没有会话可复用；
+        * **``DISCONNECTED`` 不许短路**：链路已经断了，缓存里的 profile 是**过期事实**，
+          返回它等于把"掉线"报成"已连接"。这种情况必须真重连（``note_link_down()``
+          会先把状态沉到 ``LOADED``，所以正常路径上根本走不到这里）。
+
+        ``RECONNECTING`` 仍然短路：adapter 的 ``LinkState`` 文档明确写了"此时不要重发
+        Connect" —— MAA 正在自己重连，我们再发一个只会和它打架。链路恢复后
+        ``link_state`` 回到 ``CONNECTED``，runtime 的 ``READY`` 不需要任何动作。
+
+        **"假活"场景由 ``force=True`` 兜底，不靠启发式**：设备可能 ``READY`` 但截图一直
+        超时、且没有 ``Disconnect`` 事件（于是 ``link_state`` 仍是 ``CONNECTED``）。
+        想在这里凭"上次失败过"或"最近一次截图很慢"之类的信号猜"该不该重连"，就要引入
+        一堆阈值和时序假设，猜错的代价是**把好好的会话拆掉**。所以本方法只按**可验证的
+        事实**短路（状态 + 四参数 + 链路四态）；"用户显式点了重连"这种意图由调用方用
+        ``force`` 表达（见 :meth:`connect_forced`）。
+        """
+        if self._state is not EngineState.READY or self._device is None:
+            return None
+        if self._connected_params != request:
+            return None
+        if adapter.link_state is LinkState.DISCONNECTED:
+            return None
+        logger.debug(
+            "connect reused existing session: address=%s config=%s link=%s",
+            request[0],
+            request[2],
+            adapter.link_state.value,
+        )
+        return self._device
+
+    def _drop_session(self) -> None:
+        """会话不再可信：清掉"上次成功参数"与缓存的 profile。
+
+        没有这一步，"连了一次失败"之后 ``status`` 里的 ``device`` 仍然是上一次的
+        ``connected=True`` —— 状态机说 ``loaded``、设备区说"已连接"，用户只能猜。
+        """
+        self._connected_params = None
+        self._device = None
+
     def mark_degraded(self, exc: EngineError) -> None:
         """``READY/LOADED → LOADED``，记录 ``last_error``。由 adapter 异常冒泡处调用。"""
-        if self._state in (EngineState.READY, EngineState.LOADED):
-            self._last_error = exc
-            if self._state is EngineState.READY:
-                self._set_state(EngineState.LOADED)
+        self._sink_to_loaded(exc)
+
+    def note_link_down(self, reason: str = "") -> AdbDisconnected | None:
+        """链路已断：``READY → LOADED`` 并记 ``AdbDisconnected``。不抛错、幂等。
+
+        Args:
+            reason: 链路事件带来的原因原文（``adapter.link_reason``）。空串时用一句
+                中性描述 —— **不编造**具体原因（"adb refused" 这种话只能来自上游）。
+
+        Returns:
+            本次构造的异常（**没有下沉**时返回 ``None``，调用方据此判断"该不该失败"）。
+
+        为什么由 runtime 自己收敛（而不是 adapter 断线时回调）：adapter 是「C 线程 →
+        事件循环」的桥，让它反向持有 runtime 会把依赖变成环（adapter → runtime →
+        adapter），销毁路径上尤其危险 —— C 线程仍可能在回调里打到已拆掉的 Python 对象。
+
+        所以收敛只发生在 runtime **主动读快照**的地方（:meth:`health` /
+        :meth:`status_snapshot` / :meth:`ensure_ready`），见 :meth:`_converge_link_state`。
+        """
+        if self._state is not EngineState.READY:
+            return None
+        exc = AdbDisconnected(
+            address=self._address,
+            why=reason or "link lost (MaaCore reported Disconnect without a reason)",
+            adb_path=self._adb_path,
+        )
+        self._sink_to_loaded(exc)
+        logger.info(
+            "link down (address=%s, config=%s); state -> loaded", self._address, self._connect_config
+        )
+        return exc
+
+    def _sink_to_loaded(self, exc: EngineError) -> None:
+        """``READY``（或 ``LOADED``）→ ``LOADED`` + 记 ``last_error`` + 丢掉会话缓存。"""
+        if self._state not in (EngineState.READY, EngineState.LOADED):
+            return
+        self._last_error = exc
+        self._drop_session()
+        if self._state is EngineState.READY:
+            self._set_state(EngineState.LOADED)
+
+    def _converge_link_state(self) -> AdbDisconnected | None:
+        """惰性收敛：读 adapter 的链路快照，``DISCONNECTED`` 就把 ``READY`` 沉到 ``LOADED``。
+
+        不改会怎样：断线之后 ``_state`` 仍然是 ``READY``，``health()`` / ``status`` 继续
+        报"一切就绪"，用户看着"就绪"去点截图，然后等满 8 秒 ``capture_timeout``
+        才拿到一句"截图卡住了"—— 而真正的原因（掉线）早就躺在 ``adapter.link_state`` 里。
+
+        为什么"读的时候收敛"而不是"断线时回调"：见 :meth:`note_link_down`。这里额外说明
+        **惰性**的代价与为什么可接受：断线到下一次读快照之间，``state`` 仍显示 ``READY``。
+        这个窗口不会被误用 —— 任何真的要动设备的路径（``capture()``）第一件事就是
+        ``ensure_ready()``，它自己也调本方法，所以"用之前一定已经收敛"。
+
+        Returns:
+            下沉时构造的 ``AdbDisconnected``；链路正常 / 已收敛 / 没有 adapter 时为 ``None``。
+        """
+        adapter = self._adapter
+        if adapter is None or self._state is not EngineState.READY:
+            return None
+        if adapter.link_state is not LinkState.DISCONNECTED:
+            return None
+        return self.note_link_down(adapter.link_reason)
 
     # ------------------------------------------------------------------
     # 销毁
     # ------------------------------------------------------------------
     async def destroy(self) -> None:
-        """``AsstDestroy`` 会 join 三条内部线程，**可能无限阻塞**。
+        """``AsstStop`` → ``AsstDestroy`` → （确认销毁后）``close()``。**永不抛错、可重入。**
 
-        处置：放进线程并带 ``destroy_timeout``；超时就放弃等待（接受有界泄漏 ——
-        宁可泄漏一次清理，也不能让 ``on_shutdown`` 卡死宿主）。**本方法永不抛错。**
+        三条 C 侧事实（`[FACT]` 已对 pin 住的 v6.22.0 源码逐条核对
+        ``src/MaaCore/AsstCaller.cpp`` / ``Assistant.cpp`` / ``Assistant.h``）：
+
+        ① ``AsstStop(h)`` → ``Assistant::stop(block = true)``：置 ``m_thread_idle``、
+           取一次 ``m_mutex``、清 ``m_tasks_list``、清 status 缓存。**不 join 任何线程**，
+           所以它今天**不会**长时间阻塞（量级是"抢一次未争用的 mutex + 清两个容器"，
+           亚毫秒）。真正会长时间阻塞的只有 ``AsstDestroy``。
+           → 把它挪进销毁线程的理由不是"它慢"，而是"销毁路径上不留同步 C 调用"：
+             一个子线程、一份超时预算，顺手免疫"某天上游给 stop() 加上 join"。
+        ② ``AsstDestroy(h)`` → ``delete h``：``~Assistant()`` 依次 join
+           ``m_working_thread`` / ``m_call_thread`` / ``m_msg_thread``，**可能无限阻塞**
+           （正在跑的 ``call_proc`` 要等 ADB 超时），且在**函数最后一句**才回调
+           ``Destroyed`` —— 即"回调可能来自销毁线程自身"。
+        ③ Stop 仍有真实价值：它清空待跑队列，让 ``~Assistant`` 的 join 只等**当前**这一
+           条任务，而不是"跑完当前再跑下一条"。
+
+        为此本方法有四个不变量（每一条都对应一个"会崩"的具体场景）：
+
+        * **Stop 与 Destroy 在同一个线程里顺序执行**（:meth:`_teardown_blocking`）。
+          分两个线程并发调同一个 handle 是**更糟**的 bug：``delete`` 与 ``stop`` 并发
+          = 对同一个 C++ 对象 UAF，比"只慢一点"严重得多。
+        * **线程是 daemon + 独立线程，不走 ``asyncio.to_thread``**：``to_thread`` 借的是
+          宿主事件循环的默认执行器，一个卡死的 ``AsstDestroy`` 会永久占掉宿主一个
+          worker（其它插件跟着排队），并且 ``asyncio.run()`` 收尾时的
+          ``shutdown_default_executor()`` 会把它 join 回来 —— 实测"超时 0.1s 的调用"
+          让 ``asyncio.run()`` 整整等了 3.01s（[FACT] 本机 Python 3.13.14 实测）。
+          daemon 线程不参与这两条 join，退出码不会被一次卡死拖住。
+        * **放弃等待时既 detach、也绝不 ``close()``**：``detach_callback()`` 让 C 线程
+          落回 trampoline 的空分支（逻辑 UAF 挡住）；而 ``close()`` 会解掉 ``_lib`` 与
+          ``add_dll_directory`` 句柄，此刻 C 线程可能还在懒加载依赖。放弃的那一份
+          wrapper 进 :attr:`_abandoned_wrappers` 保活 —— 这是**唯一**被允许的有界泄漏，
+          而且它有名字、能被 :attr:`lifecycle_stats` 数出来。
+        * **``_handle`` 取出后在同一段同步代码里立刻置 0**（取到与置 0 之间没有 await）：
+          C 侧 ``AsstDestroy`` 是 ``delete``，delete 两次是 UAF 而不是"多删一个空指针"。
+          重复 / 并发调用看到 0 即短路；外层还有 ``_teardown_in_progress`` 挡一次。
         """
+        if self._teardown_in_progress:
+            # 已经有一次销毁在跑：这一层挡住"并发两次 destroy 各发一次 delete"。
+            # 不排队等待是有意的 —— 我们只需要"不重复发 C 调用"，而真正需要等待的
+            # 调用方（on_shutdown）本身就是触发它的那一方。
+            logger.debug("destroy() re-entered while teardown is in progress; skipping")
+            return
+        self._teardown_in_progress = True
         try:
             if self._download_task is not None and not self._download_task.done():
                 await self.cancel_download()
@@ -909,26 +1418,20 @@ class MaaRuntime:
 
             wrapper, handle = self._wrapper, self._handle
             self._handle = 0
+            abandoned = False
             if wrapper is not None and handle:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(wrapper.destroy_instance, handle),
-                        timeout=self._destroy_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "AsstDestroy exceeded %.1fs; abandoning instance (bounded leak)",
-                        self._destroy_timeout,
-                    )
-                except Exception:  # noqa: BLE001 - shutdown 钩子必须能返回
-                    logger.debug("AsstDestroy failed", exc_info=True)
+                abandoned = not await self._teardown_instance(wrapper, handle)
             if wrapper is not None:
-                try:
-                    wrapper.close()
-                except Exception:  # noqa: BLE001
-                    logger.debug("wrapper.close failed", exc_info=True)
+                if abandoned:
+                    self._abandoned_wrappers.append(wrapper)
+                else:
+                    try:
+                        wrapper.close()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("wrapper.close failed", exc_info=True)
             self._wrapper = None
             self._device = None
+            self._connected_params = None
             self._resource_loaded = False
         finally:
             executor, self._executor = self._executor, None
@@ -936,7 +1439,84 @@ class MaaRuntime:
                 executor.shutdown(wait=False, cancel_futures=True)
             self._progress = None
             self._download_task = None
+            self._teardown_in_progress = False
             self._set_state(EngineState.ABSENT)
+
+    async def _teardown_instance(self, wrapper: MaaCoreWrapper, handle: AsstHandle) -> bool:
+        """一个线程、一份预算地跑 ``Stop → Destroy``。**返回"是否确认已销毁"。**
+
+        返回值语义是给 :meth:`destroy` 决定"能不能 ``close()``"用的：
+        ``False`` 表示"实例可能还活着、C 线程可能还在跑"，此时解引用库句柄是危险的。
+
+        超时**不取消那个线程**（Python 无法杀线程）：它会在自己返回时安静结束。
+        这正是为什么这里用 daemon 线程而不是宿主执行器 —— 见 :meth:`destroy`。
+        """
+        self._stop_calls += 1
+        self._destroy_calls += 1
+        future = _spawn_daemon_future(lambda: self._teardown_blocking(wrapper, handle))
+        try:
+            await asyncio.wait_for(
+                asyncio.wrap_future(future), timeout=self._destroy_timeout
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            # 放弃等待 = 把实例丢给 C 侧自身析构，而我们这边的 Python 状态已经拆光。
+            # 此时 C 线程**仍可能**回调进来（Destroyed 是析构的最后一句），那会打到
+            # 已销毁的 adapter/loop 上 —— 逻辑层面的 UAF。
+            # 这条必须是 error：它是"已知会崩的窗口"，不是普通告警。
+            self._destroy_abandoned += 1
+            logger.error(
+                "AsstStop/AsstDestroy exceeded %.2fs; abandoning instance. "
+                "C threads may still invoke callbacks -> detaching python target "
+                "and keeping the library handle alive to avoid use-after-free "
+                "(bounded leak by design)",
+                self._destroy_timeout,
+            )
+            self._detach_for_abandon(wrapper)
+            return False
+        except Exception:  # noqa: BLE001 - shutdown 钩子必须能返回
+            # 走到这里的只有"销毁线程抛错"：``destroy_instance`` 唯一的抛错点是
+            # ``_require_lib()``（库已被 close），也就是 **AsstDestroy 根本没发出去**。
+            # 那就和超时同性质：实例还活着、回调可能还会来。旧实现只记 debug，
+            # 等于把"实例没被销毁"这件事静默吞掉（真机上表现成关不掉的后台线程）。
+            self._destroy_abandoned += 1
+            logger.error(
+                "AsstStop/AsstDestroy raised; instance state unknown, treating as abandoned "
+                "(detaching python callback target)",
+                exc_info=True,
+            )
+            self._detach_for_abandon(wrapper)
+            return False
+        return True
+
+    @staticmethod
+    def _teardown_blocking(wrapper: MaaCoreWrapper, handle: AsstHandle) -> None:
+        """**运行在销毁线程上**：先 Stop，再 Destroy，顺序不可换、不可拆到两个线程。
+
+        ``AsstStop`` 的失败不阻止销毁（销毁优先）；``AsstDestroy`` 的异常向上抛，
+        由 :meth:`_teardown_instance` 归入"放弃"分支。
+        """
+        try:
+            wrapper.stop_tasks(handle)
+        except Exception:  # noqa: BLE001 - 销毁路径不许因为"停不下来"而中止
+            logger.debug("AsstStop before AsstDestroy failed", exc_info=True)
+        wrapper.destroy_instance(handle)
+
+    def _detach_for_abandon(self, wrapper: MaaCoreWrapper) -> None:
+        """放弃销毁时把 Python 侧回调目标摘成空，**保留 CFUNCTYPE 强引用**（防真 UAF）。
+
+        ``detach_callback`` 在 wrapper 上是可选能力（替身 wrapper 未必实现）：
+        探测不到就只留上面那条 error 日志，绝不因为"替身没这个方法"而在关机路径抛错。
+        """
+        detach = getattr(wrapper, "detach_callback", None)
+        if detach is None:
+            return
+        try:
+            detached = detach()
+        except Exception:  # noqa: BLE001 - 摘钩子失败也必须继续关机
+            logger.debug("detach_callback failed", exc_info=True)
+            return
+        if detached:
+            self._detach_invocations += 1
 
     async def purge(self) -> None:
         """删除引擎文件（只在 ``arknights_engine_repair --clean`` 时显式调用）。
@@ -1199,6 +1779,61 @@ def _percent(done: int, total: int | None, fallback_total: int) -> int | None:
     if not limit or limit <= 0:
         return None
     return max(0, min(99, int(done * 100 / limit)))
+
+
+def _spawn_daemon_future(func: Callable[[], None]) -> Future[None]:
+    """在一条 **daemon** 线程里跑 ``func``，返回可直接 ``asyncio.wrap_future`` 的 Future。
+
+    为什么不用 :func:`asyncio.to_thread`（`[FACT]` 本机 Python 3.13.14 实测）：
+
+    * ``to_thread`` 借的是事件循环的**默认执行器**。``wait_for`` 超时只会取消等待，
+      线程继续跑；如果 ``AsstDestroy`` 永不返回，宿主执行器就被永久占掉一个 worker
+      （其它插件的 ``to_thread`` 跟着排队）；再叠一次同样的卡死就会继续吃 worker。
+    * 更致命的是收尾：``asyncio.run()`` 结束时调 ``loop.shutdown_default_executor()``，
+      它**会 join 池里的线程**。实测"超时 0.1s 的 ``to_thread``"让 ``asyncio.run()``
+      整整等了 3.01s（= 那次调用的真实耗时）。也就是说 ``wait_for`` 给了我们一个
+      "以为已经放弃了"的假象，宿主关停时照样被拖住。
+    * ``concurrent.futures`` 的 worker 是**非 daemon** 且注册了 ``threading._register_atexit``，
+      进程退出时会 join 它们 —— 一次真卡死可以让进程关不掉。
+
+    daemon 线程不参与上述任何 join：超时之后它就自顾自跑完（或跑不完），
+    而关机路径已经返回了。代价是"进程退出时可能有一条线程被强行掐断在 C 里"，
+    但那时进程本来就在退出，比"关不掉"好。
+
+    异常会被搬进 Future（而不是打在日志里丢掉），这样"销毁线程抛错"能被
+    :meth:`MaaRuntime._teardown_instance` 当成"实例状态未知"来处理。
+    """
+    future: Future[None] = Future()
+
+    def _runner() -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            func()
+        except BaseException as exc:  # noqa: BLE001 - 线程里不许有未捕获异常
+            future.set_exception(exc)
+        else:
+            future.set_result(None)
+
+    threading.Thread(target=_runner, name="maa-destroy", daemon=True).start()
+    return future
+
+
+
+def _connect_request(
+    *,
+    address: str,
+    adb_path: str,
+    config: str,
+    extras: Mapping[str, str] | None,
+) -> tuple[str, str, str, tuple[tuple[str, str], ...]]:
+    """一次连接请求的**可比较指纹**：四个参数，``extras`` 归一成排序后的键值对。
+
+    ``extras`` 必须排序：``dict`` 的迭代顺序取决于插入顺序，而同一个配置解析两次
+    得到的键序理论上可以不同（配置来自外部、可能经 JSON/TOML 两次解析）。
+    不排序就会把"同一个请求"比成不同 —— 表现为每次重连都真重连，幂等短路形同虚设。
+    """
+    return (address, adb_path, config, tuple(sorted((extras or {}).items())))
 
 
 def _symbol_from(exc: BaseException) -> str | None:

@@ -37,6 +37,7 @@ from plugin.sdk.plugin import (
 
 from .companion import CompanionService
 from .companion.logic import CompanionLogic
+from .companion.service import resolve_connect_params
 from .maa.errors import EngineError
 from .maa.provision import KNOWN_RELEASES, platform_key
 from .maa.runtime import MaaRuntime
@@ -57,7 +58,16 @@ TIMEOUT_RECONNECT: Final = 45
 TIMEOUT_REPAIR: Final = 280
 
 # 允许从配置里读的键（白名单：配置是外部输入，不整包透传）。
-_CONFIG_KEYS: Final = ("adb_address", "adb_path", "verbose_diagnostics", "max_inline_image_mb")
+# 后两个键（连接配置名 / 连接 extras）由 `CompanionService.handle_reconnect()` 与
+# `_connect_quietly()` 共同使用，解析规则只有一份：`companion.service.resolve_connect_params`。
+_CONFIG_KEYS: Final = (
+    "adb_address",
+    "adb_path",
+    "adb_connect_config",
+    "adb_connect_extras",
+    "verbose_diagnostics",
+    "max_inline_image_mb",
+)
 
 
 class _StoreBridge:
@@ -349,12 +359,24 @@ class ArknightsNekoCompanion(NekoPluginBase):
             await self._connect_quietly(runtime)
 
     async def _connect_quietly(self, runtime: MaaRuntime) -> None:
-        """启动期连接：失败只记日志（``state`` 留在 ``loaded``，不是 ``failed``）。"""
+        """启动期连接：失败只记日志（``state`` 留在 ``loaded``，不是 ``failed``）。
+
+        ``adb_connect_config`` / ``adb_connect_extras`` 与 ``arknights_reconnect`` 走
+        **同一个解析函数**（``resolve_connect_params``）：启动时连上用的是哪条连接路径，
+        之后重连不能换成另一条 —— 否则 MuMu12 用户会看到"启动好好的，点一次重连就变慢"。
+
+        **不使用 ``force``**：启动期要的就是幂等。宿主热重载时 ``bootstrap()`` 可能被
+        重复调用，此时"已经在 READY 且参数没变"应当什么都不做 —— 强制重连等于白断一次链。
+        ``force`` 只属于用户显式点重连那条路（``CompanionService.handle_reconnect``）。
+        """
         config = self._config
+        connect_config, extras = resolve_connect_params(config)
         try:
             await runtime.connect(
                 address=str(config.get("adb_address", "") or ""),
                 adb_path=str(config.get("adb_path", "") or ""),
+                config=connect_config,
+                extras=extras,
             )
         except EngineError as exc:
             logger.info("startup connect not established: %s", exc)

@@ -17,6 +17,21 @@ adb_address = ""
 # 需要指定时填绝对路径（如 C:\platform-tools\adb.exe）。
 adb_path = ""
 
+# 连接配置名（AsstAsyncConnect 的第 4 个参数），留空 = "General"。
+# 不同模拟器要走的连接参数完全不同，填错的表现是"能连上，但截图慢/偶尔失败"。
+# 常见取值（由 MAA 上游定义，插件不做白名单校验，上游新增的照样能用）：
+#   General / MuMuEmulator12 / LDPlayer / BlueStacks / Nox / MEmu / Waydroid
+adb_connect_config = "General"
+
+# 某些连接配置需要的额外参数。**两种写法都行**：
+#   1) 纯路径字符串 —— MuMu12 的典型写法，等价于 {"path": <这个值>}：
+#      adb_connect_extras = "D:/Program Files/Netease/MuMuPlayer-12.0"
+#   2) JSON 对象字符串 —— 上游要多个键时用（值只接受字符串/数字/布尔）：
+#      adb_connect_extras = '{"path": "D:/Program Files/Netease/MuMuPlayer-12.0"}'
+# 留空 = 不下发 extras。**填坏了不会让插件起不来**：解析失败会降级为"不传 extras"
+# 并记一条 warning，实际用的配置名可以在 arknights_status 的 data.connect_config 里核对。
+adb_connect_extras = ""
+
 # 诊断模式：true 时入口的 data 里会带更多**结构化**字段
 # （仍然不含绝对路径、不进聊天窗）。
 verbose_diagnostics = false

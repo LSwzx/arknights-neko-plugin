@@ -52,7 +52,8 @@ startup_failure = "warn"
 
 # ---------------------------------------------------------------------------
 # 业务配置段（自定义顶层段，官方 SDK 支持）。
-# 只读白名单键：adb_address / adb_path / verbose_diagnostics / max_inline_image_mb。
+# 只读白名单键：adb_address / adb_path / adb_connect_config / adb_connect_extras
+#              / verbose_diagnostics / max_inline_image_mb。
 # **没有 maa_root / resource_dir 之类的路径配置**：引擎只有一个权威位置
 # = data_path("maa")，不读外部路径、不探测 winget/注册表/环境变量（D6）。
 # ---------------------------------------------------------------------------
@@ -63,6 +64,14 @@ startup_failure = "warn"
 adb_address = ""
 # adb 可执行文件路径；留空则用 MAA 内置的 adb。
 adb_path = ""
+# 连接配置名（AsstAsyncConnect 的第 4 个参数）。留空 = General。
+# 常见值：General / MuMuEmulator12 / LDPlayer / BlueStacks / Nox / MEmu / Waydroid。
+# 不在这里做白名单校验：MAA 上游会新增模拟器，插件锁清单只会把"上游支持了"变成"我们拒了"。
+adb_connect_config = "General"
+# 连接配置需要的额外参数：纯路径字符串（等价于 {"path": <它>}）或 JSON 对象字符串。
+# MuMu12 的典型值："D:/Program Files/Netease/MuMuPlayer-12.0"。
+# 坏值（半截 JSON / 数组）只降级为"不传 extras" + 一条 warning，不会让启动失败。
+adb_connect_extras = ""
 # 诊断模式：true 时会在 entry 的 data 里带更多**结构化**字段（仍然不含绝对路径、不进聊天窗）。
 verbose_diagnostics = false
 # 内联图片上限（MB）。超过就先走 ctx.images.upload，上传不可用时降级落盘给路径。

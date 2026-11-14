@@ -44,6 +44,7 @@ push_message（v2）的三条硬规则
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -82,6 +83,8 @@ __all__ = [
     "render_error",
     "push_meta",
     "sanitize_maa_text",
+    "DEFAULT_CONNECT_CONFIG",
+    "resolve_connect_params",
     "STATE_TEXT",
     "STATE_LABEL",
 ]
@@ -122,6 +125,121 @@ StorePort = Callable[[str], Awaitable[Any]]
 ConfigPort = Callable[[], Mapping[str, Any]]
 """``() -> 当前配置快照``。用可调用对象而不是 dict，是为了热更新后不必重建 service。"""
 
+DEFAULT_CONNECT_CONFIG: Final[str] = "General"
+"""``AsstAsyncConnect`` 的第 4 个参数的默认值（MAA 自己的默认配置名）。"""
+
+_EXTRAS_PATH_KEY: Final[str] = "path"
+"""纯路径形态的 extras 落到哪个键。
+
+对 MuMu12 这类"按安装目录找自带 adb"的配置，MAA 的 extras 只认 ``path``
+（``maa/runtime.py::MaaRuntime.connect`` 的文档给了同一个例子
+``{"path": "...\\MuMuPlayer-12.0"}``）。这里只描述**用户没写 JSON 时的落点**，
+不限制用户自己写 JSON 用别的键 —— 能不能用由 MaaCore 决定，不由我们猜。
+"""
+
+
+def resolve_connect_params(config: Mapping[str, Any]) -> tuple[str, dict[str, str] | None]:
+    """把**用户配置**翻译成 ``runtime.connect()`` 的 ``(config, extras)``。
+
+    两个键（都在配置白名单里，见 ``__init__._CONFIG_KEYS``）：
+
+    * ``adb_connect_config``：连接配置名。**不做白名单硬拒绝** —— MAA 上游会新增
+      模拟器（``MuMuEmulator12`` / ``LDPlayer`` / ``Waydroid`` …），我们在这里锁死
+      一份清单，等于把"上游支持了但我们拒了"变成常态。空串/非字符串只做两件事：
+      空串回落 ``"General"``、非字符串 ``str()`` 化（TOML 里写 ``123`` 的人，
+      想要的一定是 ``"123"`` 这个配置名，不是让它静默消失）。
+    * ``adb_connect_extras``：某个配置需要的额外参数。接受两种形态：
+
+      1. **JSON 对象字符串**：``'{"path": "D:/Program Files/Netease/MuMuPlayer-12.0"}'``
+         —— 上游新增键时不必改代码；
+      2. **纯路径字符串**：``"D:/Program Files/Netease/MuMuPlayer-12.0"``
+         —— 等价于 ``{"path": <它>}``，这是 MuMu12 唯一需要的形态，没必要逼用户手写 JSON。
+
+      也接受**已经是 Mapping** 的形态（宿主若把配置段解析成嵌套表就是这样）。
+
+    **坏值一律降级为空 extras + 一条 warning，绝不抛错**：这两个键只影响"连接走哪条
+    路径"，而配置是外部输入 —— 一处手滑（少个大括号、写成 TOML 数组）不该让整个插件
+    起不来。降级的后果是"连接退回 General 路径"，用户能从 ``arknights_status`` 的
+    ``data.connect_config`` 看到这件事。
+
+    为什么"看起来像 JSON 就必须是 JSON"：以 ``{`` 开头的串如果解析失败还硬当路径用，
+    MAA 会拿到一串半截 JSON 当安装目录 —— 那会表现成"连上了但截图很怪"，
+    比"没配 extras"难查得多。所以这里宁可丢，也不猜。
+    """
+    name = _connect_config_name(config.get("adb_connect_config"))
+    extras = _connection_extras(config.get("adb_connect_extras"), config_name=name)
+    return name, extras
+
+
+def _connect_config_name(raw: Any) -> str:
+    """配置名归一：``None``/空串 → ``"General"``；非字符串 → ``str()``。"""
+    if raw is None:
+        return DEFAULT_CONNECT_CONFIG
+    text = raw.strip() if isinstance(raw, str) else str(raw).strip()
+    if not isinstance(raw, str):
+        logger.warning("adb_connect_config=%r 不是字符串，按 %r 使用", raw, text)
+    return text or DEFAULT_CONNECT_CONFIG
+
+
+def _connection_extras(raw: Any, *, config_name: str) -> dict[str, str] | None:
+    """``adb_connect_extras`` → ``dict[str, str]``；任何坏值都返回 ``None``。"""
+    if raw is None:
+        return None
+    if isinstance(raw, Mapping):
+        return _scalar_mapping(raw, config_name=config_name)
+    if not isinstance(raw, str):
+        logger.warning(
+            "adb_connect_extras 期望字符串或表，实际 %s；已忽略（连接按 %s 走）",
+            type(raw).__name__,
+            config_name,
+        )
+        return None
+
+    text = raw.strip()
+    if not text:
+        return None
+    if not text.startswith("{"):
+        # 纯路径形态：MuMu12 的典型写法，等价于 {"path": <它>}
+        return {_EXTRAS_PATH_KEY: text}
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "adb_connect_extras 看起来是 JSON 但解析失败（%s）；已忽略（连接按 %s 走）",
+            exc.msg,
+            config_name,
+        )
+        return None
+    if not isinstance(parsed, Mapping):
+        logger.warning(
+            "adb_connect_extras 的 JSON 不是对象（%s）；已忽略（连接按 %s 走）",
+            type(parsed).__name__,
+            config_name,
+        )
+        return None
+    return _scalar_mapping(parsed, config_name=config_name)
+
+
+def _scalar_mapping(raw: Mapping[Any, Any], *, config_name: str) -> dict[str, str] | None:
+    """只保留"键非空 + 值是标量"的项；嵌套表/列表一律丢弃并记一条 warning。"""
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        if not name:
+            logger.warning("adb_connect_extras 里有空键；已跳过（连接按 %s 走）", config_name)
+            continue
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            out[name] = str(value)
+        elif isinstance(value, str):
+            if value.strip():
+                out[name] = value
+        else:
+            logger.warning(
+                "adb_connect_extras[%r] 不是标量（%s）；已跳过", name, type(value).__name__
+            )
+    return out or None
+
 
 class RuntimePort(Protocol):
     """``MaaRuntime`` 在本模块眼里的**窄接口**（六个成员，一个不多）。
@@ -150,7 +268,14 @@ class RuntimePort(Protocol):
 
     async def capture(self) -> bytes: ...
 
-    async def connect(self, *, address: str, adb_path: str = "") -> Any: ...
+    async def connect(
+        self,
+        *,
+        address: str,
+        adb_path: str = "",
+        config: str = DEFAULT_CONNECT_CONFIG,
+        extras: Mapping[str, str] | None = None,
+    ) -> Any: ...
 
     async def cancel_download(self) -> None: ...
 
@@ -384,6 +509,23 @@ _KIND_DOMAINS: Final[Mapping[ErrorCode, Any]] = {
     ErrorCode.ENGINE_DOWNLOAD_FAILED: DownloadFailure,
     ErrorCode.ENGINE_UNPACK_FAILED: UnpackFailure,
 }
+
+_CLIENT_SCOPE_NOTE: Final[str] = (
+    "顺便说清楚喵：我只支持国服官服（鹰角官方客户端、中国大陆区服），"
+    "外服和渠道服的客户端资源跟官服不是同一套 —— 资源这一关过不去，换成官服客户端就行。"
+)
+"""资源家族失败的固定补充句：「本插件只支持国服官服」。
+
+**为什么必须有这一句**：MaaCore 没有任何 C API 能查询"当前连的是哪个客户端"（客户端
+类型是识别阶段模板匹配出来的内部状态），所以"声明范围"是唯一诚实的表达；而声明如果不
+出现在**用户第一次失败**的那条消息里，就等于不存在 —— 外服用户会去反复重启、重下引擎、
+换端口，全都无效。
+
+**为什么是文案常量而不是读 ``SUPPORTED_CLIENT_SCOPE``**：那个声明住在 ``maa.runtime``，
+而本模块 import 它违反 X03（业务层不许拖入 ctypes/网络栈）。所以这里放的是**人话**，
+机器值随 ``status_snapshot()['client_scope']`` 走 ``data``（见 :meth:`CompanionService._snapshot`）。
+两处措辞若改动需要一起改 —— 一句在聊天窗，一个在诊断字段，语义必须指向同一个范围。
+"""
 
 
 def _validate_kind_domains(
@@ -788,6 +930,10 @@ def render_error(
         detail = _resource_detail(exc)
         if detail:
             parts.append(_text(detail))
+        # 资源三兄弟（missing / load_rejected / instance.create_failed）是**同一个根因族**：
+        # 资源树跟引擎对不上。外服客户端在这里必然失败，所以这句话三家都带上 ——
+        # 只给"路径不存在"那一档加，会让"资源加载被拒"的外服用户继续去重下引擎。
+        parts.append(_text(_CLIENT_SCOPE_NOTE))
 
     # --- 上游可控文本：消毒后**单独成段**，作为引用数据（K8） ---
     upstream = str(getattr(exc, "why", "") or "")
@@ -1297,14 +1443,60 @@ class CompanionService:
         )
 
     async def handle_reconnect(self) -> StatusOutcome:
-        """重连设备。地址来自**配置**（``adb_address``），空着就明确说"没配"、不回落 5555。"""
+        """重连设备。地址与**连接配置**都来自配置（空地址就明确说"没配"、不回落 5555）。
+
+        ``adb_connect_config`` / ``adb_connect_extras`` 在这里原样透传给 ``runtime.connect``
+        （解析规则见 :func:`resolve_connect_params`）。**默认值不往下传** ——
+        ``RuntimePort`` 的窄接口只有 ``address`` / ``adb_path``，而
+        ``config="General"`` / ``extras=None`` 与"不传"在 runtime 里语义完全等价，
+        总是传只会让只实现窄接口的端口实现收到不认识的关键字参数。见 :meth:`_connect_kwargs`。
+
+        **这是"用户显式点了重连"**，所以优先走 ``connect_forced()``（= ``connect(force=True)``）：
+        否则设备"假活"时（``READY`` 但截图一直超时、没有 ``Disconnect`` 事件）会被幂等
+        短路成"什么都没发生"，用户只会认为按钮坏了。``connect_forced`` 是**可选能力**，
+        用 ``getattr`` 探测（与 ``handle_engine_repair`` 探测 ``purge`` 同一套写法）：
+        端口实现没有它就退回普通 ``connect()``，行为与以前一致，不会因为多一个可选能力
+        要求所有实现都改签名。
+        """
         config = self._config()
         address = str(config.get("adb_address", "") or "").strip()
         adb_path = str(config.get("adb_path", "") or "").strip()
-        diagnostics: dict[str, Any] = {"address_configured": bool(address)}
+        connect_config, extras = resolve_connect_params(config)
+        kwargs = self._connect_kwargs(
+            address=address,
+            adb_path=adb_path,
+            config=connect_config,
+            extras=extras,
+        )
+        # 能力探测：真 runtime 有 connect_forced，用例替身/老实现没有。
+        force_connect = getattr(self._runtime, "connect_forced", None)
+        diagnostics: dict[str, Any] = {
+            "address_configured": bool(address),
+            # 配置名与 extras 的**键**（不含值：值是用户机器上的绝对路径，只进日志）
+            "connect_config": connect_config,
+            "extras_keys": sorted(extras or {}),
+            # False = 这个端口实现没有强制重连能力，走的是普通 connect（可能被幂等短路）
+            "forced": callable(force_connect),
+        }
         steps: list[str] = ["connect"]
         try:
-            device = await self._runtime.connect(address=address, adb_path=adb_path)
+            try:
+                if callable(force_connect):
+                    device = await force_connect(**kwargs)
+                else:
+                    device = await self._runtime.connect(**kwargs)
+            except TypeError:
+                # 端口实现的 connect 只认 (address, adb_path)：我们多传的 config/extras 被
+                # Python 拒了（这也是 _connect_kwargs 只在"用户真的配了"时才下发的理由）。
+                # **文案不动**（改文案要动错误分档，收益不抵风险），只留一条能定位的 warning，
+                # 其余异常照样往上走。只吞 TypeError —— 扩成 Exception 会把真故障也伪装成这条。
+                rejected = [key for key in ("config", "extras") if key in kwargs]
+                logger.warning(
+                    "runtime.connect() 不接受连接参数（被拒的键：%s）；"
+                    "该端口实现只支持 address/adb_path，本次连接参数没有生效",
+                    "/".join(rejected) if rejected else "无（kwargs 只有基础参数）",
+                )
+                raise
         except EngineError as exc:
             steps.append("failed")
             parts = self._render_error(exc)
@@ -1703,6 +1895,23 @@ class CompanionService:
         if isinstance(pieces, (list, tuple)):
             safe["missing_pieces"] = [str(item) for item in pieces]
 
+        # 三个**封闭词表**的短字符串：范围声明 / 链路四态 / 连接配置名。
+        # 它们进 data 的理由都是"让报障能当场排除一个变量"：
+        #   * client_scope：识别不准时先排除"外服"（我们只支持国服官服）；
+        #   * link_state：断线后 state 是 loaded，光看 state 看不出"为什么退回 loaded"；
+        #   * connect_config：模拟器填错配置名时，用户能当场看到"实际走的是哪条连接路径"。
+        # 仍然过一遍 sanitize_maa_text：connect_config 是用户可控字符串（理论上能填路径）。
+        for key, limit in (("client_scope", 32), ("link_state", 32), ("connect_config", 64)):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                safe[key] = sanitize_maa_text(value, limit=limit)
+
+        # extras 下发结果：None（这次连接没配）/ {"keys", "dispatched", "error"}。
+        # 这是"配了 MuMu12 却没生效"在用户侧的**唯一可见证据**（C 侧 void + 静默 return，
+        # 不会报错），所以必须进 data。键名与错误串都过消毒；路径值本来就没进 runtime 这个字段。
+        if "connection_extras" in raw:
+            safe["connection_extras"] = _safe_connection_extras(raw.get("connection_extras"))
+
         device = raw.get("device")
         if isinstance(device, Mapping):
             safe["device"] = _safe_device(device)
@@ -1772,6 +1981,27 @@ class CompanionService:
             logger.warning("config_get() failed; using empty config", exc_info=True)
             return {}
         return config if isinstance(config, Mapping) else {}
+
+    @staticmethod
+    def _connect_kwargs(
+        *,
+        address: str,
+        adb_path: str,
+        config: str,
+        extras: Mapping[str, str] | None,
+    ) -> dict[str, Any]:
+        """组 ``runtime.connect()`` 的关键字参数：**只把用户真正改过的传下去**。
+
+        ``config == "General"`` / ``extras`` 为空时不下发，因为那与 runtime 的默认值
+        逐字等价；而下发默认值会让每一个只实现窄接口（``address`` + ``adb_path``）的
+        端口实现炸成 ``TypeError`` —— 把"用户没配"变成"插件坏了"，是最不该发生的降级。
+        """
+        kwargs: dict[str, Any] = {"address": address, "adb_path": adb_path}
+        if config != DEFAULT_CONNECT_CONFIG:
+            kwargs["config"] = config
+        if extras:
+            kwargs["extras"] = dict(extras)
+        return kwargs
 
     # ------------------------------------------------------------------
     # 内部：图片交付
@@ -1920,6 +2150,30 @@ def _safe_device(device: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(value, int) and not isinstance(value, bool):
             safe[key] = value
     return safe
+
+
+def _safe_connection_extras(value: Any) -> dict[str, Any] | None:
+    """``status_snapshot()['connection_extras']`` → 进 ``data`` 的形态。
+
+    ``None`` 原样保留（= 这次连接没配 extras，"没配"与"配了没发出去"必须可区分）。
+    非 Mapping 一律折成 ``None``：这个字段只有 runtime 会写，形状不对说明有人在别处
+    塞了东西，按"没有信息"处理比原样透传安全。
+
+    ``keys`` / ``error`` 都过 :func:`sanitize_maa_text`：键名本该是 ``path`` 这种短标识，
+    但配置是外部输入（``{"C:\\Users\\me": ...}`` 这种键名并非不可能）；``error`` 来自
+    异常原文，可能带库路径（``MaaCallError.detail`` 里有 ``library_path``）。
+    """
+    if not isinstance(value, Mapping):
+        return None
+    out: dict[str, Any] = {"dispatched": bool(value.get("dispatched"))}
+    keys = value.get("keys")
+    if isinstance(keys, (list, tuple)):
+        picked = [sanitize_maa_text(str(key), limit=32) for key in keys[:6]]
+        out["keys"] = [key for key in picked if key]
+    error = value.get("error")
+    if isinstance(error, str) and error.strip():
+        out["error"] = sanitize_maa_text(error, limit=120)
+    return out
 
 
 def _safe_error(error: Mapping[str, Any]) -> dict[str, Any]:

@@ -139,6 +139,8 @@ class FakeMaaCore:
         start_returns: int = 1,
         stop_returns: int = 1,
         append_task_returns: int = 1,
+        instance_option_returns: int = 1,
+        destroy_delay: float = 0.0,
         version: bytes = b"v0.0.0-fake",
     ) -> None:
         self.payload = make_png() if payload is None else payload
@@ -154,6 +156,9 @@ class FakeMaaCore:
         self.start_returns = start_returns
         self.stop_returns = stop_returns
         self.append_task_returns = append_task_returns
+        self.instance_option_returns = instance_option_returns
+        # 模拟"AsstDestroy 会 join 三条内部线程、可能长时间阻塞"（R20 用）
+        self.destroy_delay = float(destroy_delay)
         self.version = version
 
         self.call_log: list[str] = []
@@ -162,6 +167,13 @@ class FakeMaaCore:
         self.appended_tasks: list[str] = []
         self.destroyed_handles: list = []
         self.connection_extras: list[tuple[str, str]] = []
+        self.connect_configs: list[str] = []
+        # ``(key, value)``：key 是 C 枚举的 int，value 是字符串（不是 bool）
+        self.instance_options: list[tuple[int, str]] = []
+        self.instance_option_handles: list = []
+        # 每次 AsstGetImage 的 buff_size（W29 用它断言"最大分配"与"倍增梯度"）
+        self.image_buff_sizes: list[int] = []
+        self.detach_calls = 0
         self._img_calls = 0
 
         self._fns: dict[str, _FakeFunc] = {}
@@ -199,6 +211,7 @@ class FakeMaaCore:
 
     def _get_image(self, handle, buff, buff_size, *, bgr: bool):
         self._log("AsstGetImageBgr" if bgr else "AsstGetImage")
+        self.image_buff_sizes.append(int(buff_size))
         ret = self._next_image_return(int(buff_size))
         if ret in (0, self.null_size):
             return ret
@@ -231,10 +244,15 @@ class FakeMaaCore:
         fn("AsstAsyncConnect", self._asst_async_connect)
         fn("AsstAsyncScreencap", self._asst_async_screencap)
         fn("AsstConnected", lambda h: self.connected_returns)
-        fn("AsstStop", lambda h: self.stop_returns)
+        # ``AsstStop`` 必须进 ``call_log``：R20 要断言"Stop 先于 Destroy"这条
+        # **顺序**契约，而顺序只能从调用日志读到。以前用裸 lambda（不记日志），
+        # 于是"Stop 到底有没有在 Destroy 之前被调用"在 fake 层面根本无法观测 ——
+        # 一条安全断言被静默降级成"读代码的人相信它是这样"。
+        fn("AsstStop", self._asst_stop)
         fn("AsstAppendTask", self._asst_append_task)
         fn("AsstStart", lambda h: self.start_returns)
         fn("AsstSetConnectionExtras", self._asst_set_connection_extras)
+        fn("AsstSetInstanceOption", self._asst_set_instance_option)
         fn("AsstLog", lambda level, msg: self._log("AsstLog"))
 
     def _asst_set_user_dir(self, path):
@@ -251,13 +269,28 @@ class FakeMaaCore:
         self._log("AsstCreateEx")
         return self.create_returns
 
+    def _asst_stop(self, handle):
+        """``AsstStop``：**必须记日志**（R20 的顺序断言只认 ``call_log``）。"""
+        self._log("AsstStop")
+        return self.stop_returns
+
     def _asst_destroy(self, handle):
         self._log("AsstDestroy")
         self.destroyed_handles.append(handle)
+        if self.destroy_delay > 0:
+            import time as _time
+            _time.sleep(self.destroy_delay)
         return None
+
+    def _asst_set_instance_option(self, handle, key, value):
+        self._log("AsstSetInstanceOption")
+        self.instance_options.append((int(key), _as_text(value)))
+        self.instance_option_handles.append(handle)
+        return self.instance_option_returns
 
     def _asst_async_connect(self, handle, adb_path, address, config, block):
         self._log("AsstAsyncConnect")
+        self.connect_configs.append(_as_text(config))
         if block not in (0, None):
             # 真实契约要求 block=False；记下来供用例断言
             self.call_log.append(f"BLOCK={block}")

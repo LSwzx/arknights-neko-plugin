@@ -68,6 +68,7 @@ __all__ = [
     "READONLY_TASK_TYPES",
     "ALLOWED_DEBUG_MODES",
     "ResolutionStatus",
+    "LinkState",
     "Resolution",
     "DeviceProfile",
     "MaaEvent",
@@ -116,6 +117,30 @@ class _ResolutionInvariantError(AssertionError, ValueError):
     测试计划 A05 要求"必须 AssertionError"。两个都是"构造期不变量"的合法表达，
     这里用双继承让**两种断言写法都能接住**，而不是让文档与用例二选一。
     """
+
+
+class LinkState(enum.Enum):
+    """链路四态。来自 ``ConnectionInfo`` 事件，**只描述链路，不判定连接成败**。
+
+    为什么要单独一个状态：连接成功的终态判据只有 ``AsyncCallInfo{Connect}.ret``
+    一条路，但**断线不是"一次调用失败"，而是"链路没了"**。
+    没有这个状态，一次 ``Disconnect`` 之后唯一的反应是继续干等 ``connect_timeout``
+    （默认 10s）或 ``capture_timeout``（8s），用户看到的是"卡住"。
+
+    四态对应 MAA 的 ``what``：
+
+    | LinkState | 事件 | 含义 |
+    |---|---|---|
+    | ``CONNECTED`` | ``Connected`` / ``Reconnected`` / ``UuidGot`` | 链路在 |
+    | ``RECONNECTING`` | ``Reconnecting`` | MAA 正在自己重连，**此时不要重发 Connect** |
+    | ``DISCONNECTED`` | ``Disconnect`` | 链路已断，挂起的调用必须**立刻**失败 |
+    | ``UNKNOWN`` | 会话重置 / 事件未到 | 不是失败，只是没有事实 |
+    """
+
+    UNKNOWN = "unknown"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    DISCONNECTED = "disconnected"
 
 
 class ResolutionStatus(enum.Enum):
@@ -248,6 +273,11 @@ class MaaAdapter:
         self._connect_failed_why = ""
         self._address = ""
         self._adb_path = ""
+        # 链路状态：由 ConnectionInfo 事件推进，**只作事实记录**。
+        # 它不参与"连接成功与否"的终态判定（那只有 AsyncCallInfo.ret 一条路），
+        # 但它是"断线了要不要继续干等超时"的唯一依据。
+        self._link = LinkState.UNKNOWN
+        self._link_reason = ""
 
         self._dispatch_errors = 0
         self._events_received = 0
@@ -405,11 +435,37 @@ class MaaAdapter:
         )
 
     def _reset_session(self) -> None:
-        """每次 Connect 都是新会话：分辨率/uuid/失败原因都必须从头来。"""
+        """每次 Connect 都是新会话：分辨率/uuid/失败原因/链路状态都必须从头来。"""
         self._resolution = Resolution(ResolutionStatus.UNKNOWN)
         self._uuid = ""
         self._connect_failed_why = ""
+        self._link = LinkState.UNKNOWN
+        self._link_reason = ""
         self._resolution_event = asyncio.Event()
+
+    def _fail_pending_calls(self, whats: tuple[str, ...], reason: str) -> int:
+        """把 ``what`` 命中且仍在等的调用**立刻**置为失败，返回条数。
+
+        为什么"置失败"而不是"取消 Future"：取消会让调用方拿到
+        ``CancelledError``，那是"被外部打断"的语义；断线的语义是"这次调用输了"，
+        必须与"真的 ret=False"走同一条错误分支（``AdbDisconnected`` / ``CaptureFailed``），
+        否则用户会在服务层看到两种不同的失败，而它们其实是同一件事。
+
+        注入的 payload 刻意与 MAA 自己发的 ``AsyncCallInfo`` 同形
+        （``{"ret": False, "error": ..., "cost": None}``），这样下游一行分支都不用改。
+        """
+        with self._lock:
+            victims = [cid for cid, slot in self._pending.items() if slot.what in whats]
+            slots = [self._pending.pop(cid) for cid in victims]
+        failed = 0
+        for slot in slots:
+            if slot.abandoned or slot.future.done():
+                continue
+            slot.future.set_result({"ret": False, "error": reason, "cost": None})
+            failed += 1
+        if failed:
+            logger.debug("failed %d pending call(s) early: %s", failed, reason)
+        return failed
 
     async def wait_resolution(self, *, timeout: float) -> Resolution:
         """等待分辨率落定。
@@ -423,6 +479,16 @@ class MaaAdapter:
     def resolution(self) -> Resolution:
         """同步读当前分辨率快照（不等待）。供 ``runtime.health()`` 用。"""
         return self._resolution
+
+    @property
+    def link_state(self) -> LinkState:
+        """链路四态快照（``Disconnect`` 之后立刻是 ``DISCONNECTED``，不等超时）。"""
+        return self._link
+
+    @property
+    def link_reason(self) -> str:
+        """最近一次链路事件的原因原文（上游机器值，**给用户前必须消毒**）。"""
+        return self._link_reason
 
     # --- 捕获 ---
     async def capture(self) -> bytes:
@@ -654,15 +720,40 @@ class MaaAdapter:
         self._broadcast(event)
 
     def _observe(self, event: MaaEvent) -> None:
-        """记录"只该记、不该判"的事实：uuid 与分辨率三态。
+        """记录"只该记、不该判"的事实：uuid / 分辨率三态 / 链路状态。
 
         **不做终态判定**：终态只有 ``AsyncCallInfo.ret`` 一条路。
+        唯一的例外是 ``Disconnect`` / ``ScreencapFailed``：它们不是"结果未到"，
+        而是"结果不会来了"，此时把挂起的调用**立刻**置为失败，
+        而不是让调用方陪着 8~10 秒的超时一起干等。走的是同一条
+        ``ret is not True`` 分支，所以错误类型与文案与"真失败"完全一致
+        （不新增错误语义，只是缩短发现时间）。
         """
         if event.uuid and not self._uuid:
             self._uuid = event.uuid
 
         what = event.what
-        if what == "ResolutionGot":
+        if what in ("Connected", "Reconnected"):
+            self._link = LinkState.CONNECTED
+            self._link_reason = ""
+        elif what == "Reconnecting":
+            self._link = LinkState.RECONNECTING
+            self._link_reason = _event_reason(event, "MAA is reconnecting")
+        elif what == "Disconnect":
+            self._link = LinkState.DISCONNECTED
+            self._link_reason = _event_reason(event, "device disconnected")
+            # 链路没了：Connect（还在等 ret）与 Screencap（还在等回调）都不会再有结果。
+            self._fail_pending_calls(
+                ("Connect", "Screencap"), self._link_reason
+            )
+        elif what == "ScreencapFailed":
+            # 单次截图失败不等于断线，但挂起的那次截图已经没救了。
+            self._link_reason = _event_reason(event, "screencap failed")
+            self._fail_pending_calls(("Screencap",), self._link_reason)
+        elif what == "TouchModeNotAvailable":
+            # 触摸模式不被设备接受：记事实，不改链路状态（连接本身是好的）。
+            self._link_reason = _event_reason(event, "touch mode not available")
+        elif what == "ResolutionGot":
             width, height = _resolution_dims(event.details)
             resolution: Resolution
             if _is_positive_int(width) and _is_positive_int(height):
@@ -802,6 +893,23 @@ class MaaAdapter:
         self._error_seq += 1
         self._last_error = exc
         return exc
+
+
+def _event_reason(event: MaaEvent, default: str) -> str:
+    """链路事件的原因原文：``raw.why`` → ``details.why`` → ``details.error`` → 默认值。
+
+    三种来源都试，是因为 MAA 不同版本的 ``ConnectionInfo`` 把原因放在不同层
+    （``details`` 里有，也有直接平铺的）。**只取非空字符串**，绝不 ``str()`` 一个对象
+    —— 那会把 ``None`` 变成 ``"None"`` 混进给用户看的文本里。
+    """
+    for value in (
+        event.raw.get("why"),
+        event.details.get("why"),
+        event.details.get("error"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value
+    return default
 
 
 def _resolution_dims(details: Mapping[str, Any]) -> tuple[Any, Any]:

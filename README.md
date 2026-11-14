@@ -58,7 +58,7 @@
 ```
 neko-plugin/                                  # ← 仓库根 = 插件目录（目录名 = plugin_id）
 ├── plugin.toml                               # 插件清单
-├── config.example.toml                       # 配置模板（[arknights] 四键，随插件一起分发）
+├── config.example.toml                       # 配置模板（[arknights] 六键，随插件一起分发）
 ├── __init__.py                               # 宿主接线层：7 个入口纯路由 + 2 个 lifecycle 钩子
 ├── maa/                                      # 引擎侧（纯标准库，可脱离宿主单测）
 │   ├── errors.py                             # 稳定错误码 + 异常族 + 脱敏渲染
@@ -154,24 +154,53 @@ neko-plugin/                                  # ← 仓库根 = 插件目录（�
 
 ## ADB 配置
 
-配置只有四个键（`plugin.toml` 的 `[arknights]` 段，或插件设置页）：
+配置只有六个键（`plugin.toml` 的 `[arknights]` 段，或插件设置页）：
 
 ```toml
 [arknights]
 adb_address = ""              # 模拟器地址，如 "127.0.0.1:5555"
 adb_path = ""                 # adb 可执行文件；留空用 MAA 内置的 adb
+adb_connect_config = "General"  # 连接配置名：General / MuMuEmulator12 / LDPlayer / …
+adb_connect_extras = ""       # 连接配置的额外参数，见下面 MuMu12 的例子
 verbose_diagnostics = false    # true 时入口 data 里带更多结构化字段
 max_inline_image_mb = 2       # 内联图片上限（MB），超过则先上传、失败降级落盘
 ```
 
-两个必须知道的语义：
+四个必须知道的语义：
 
 - **`adb_address` 留空就是不连。** 不会回落到 `5555`——各家模拟器、同一家不同版本的端口
   都不一样，写死一个数字只会让用户"照抄了还是连不上"。此时会明确告诉你"还没告诉我地址，
   所以我根本没去连"（错误码 `adb.address_missing`）。
+- **`adb_connect_config` 决定走哪条连接路径。** 不同模拟器的连接参数完全不同；留空或空串
+  回落 `General`。**不做白名单校验**（MAA 上游会新增模拟器，锁清单只会把"上游支持了"
+  变成"我们拒了"）。填错的表现不一定"连不上"：按上游配置的差异，可能是"能用但不稳"
+  （截图慢、偶发失败），也可能是直接连不上 —— 所以它和 `link_state` 一起出现在
+  `arknights_status` 的 `data` 里，方便当场核对是不是填错了。
+- **`adb_connect_extras` 只给需要的配置用。** 两种写法等价：
+  - 纯路径（MuMu12 的典型写法，等价于 `{"path": <它>}`）：
+    `adb_connect_extras = "D:/Program Files/Netease/MuMuPlayer-12.0"`
+  - JSON 对象（上游要多个键时）：`adb_connect_extras = '{"path": "D:/…/MuMuPlayer-12.0"}'`
+
+  MuMu12 的完整例子：
+
+  ```toml
+  adb_address = "127.0.0.1:16384"        # MuMu12 常见端口（以模拟器里显示的为准）
+  adb_connect_config = "MuMuEmulator12"
+  adb_connect_extras = "D:/Program Files/Netease/MuMuPlayer-12.0"
+  ```
+
+  **填坏了不会让插件起不来**：半截 JSON / 数组这类形态会被丢弃（降级为"不传 extras"）
+  并记一条 warning；以 `{` 开头却解析失败的串**不会**被当成路径硬塞给 MAA——
+  那会表现成"连上了但截图很怪"，比"没配 extras"难查得多。
 - **引擎路径不可配置。** 没有 `resource_dir` / `maa_root` 这类键（旧版有，已删除）。
   引擎只有 `data_path("maa")` 一个位置；这个真实路径会出现在 `arknights_status` 与
   `arknights_engine_repair` 返回的 `data.engine_root` 里，手动放置时照着它放。
+
+**资源加载范围：只支持国服官服。** MaaCore 没有任何 C API 能查询"当前连的是哪个客户端"
+（客户端类型是识别阶段模板匹配出来的内部状态），所以插件把范围写成**声明**：
+`arknights_status` 的 `data.client_scope` 恒为 `cn-official`，而 `resource.missing` /
+`resource.load_rejected` / `instance.create_failed` 这三条资源族失败的文案里会直接写明
+"只支持国服官服"。外服/渠道服的客户端资源与官服不是同一套，在资源加载这一关一定过不去。
 
 ## 7 个入口
 
@@ -182,7 +211,7 @@ max_inline_image_mb = 2       # 内联图片上限（MB），超过则先上传�
 | `arknights_analyze_stage` | 关卡分析 | 60 s | 给了 `stage`（如 `1-7`）就是纯文本分析，不依赖设备；不给则尝试看画面（本轮未接线，会如实说明） |
 | `arknights_roguelike_advice` | 肉鸽建议 | 30 s | 集成战略的启发式建议，最多三条。**纯静态知识，不联网、不读设备** |
 | `arknights_memory` | 陪玩记忆 | SDK 默认 | 汇总已缓存的干员 / 仓库 / 最近关卡；读失败一律回落 `null`，不报错 |
-| `arknights_reconnect` | 重新连接 | 45 s | 按 `adb_address` 重连；地址为空会明确说"没去连"，绝不回落 5555 |
+| `arknights_reconnect` | 重新连接 | 45 s | 按 `adb_address` + `adb_connect_config` 重连；地址为空会明确说"没去连"，绝不回落 5555。**永远真重连**（`force=True`，不复用旧会话）—— 设备"假活"时点它才有意义；幂等短路只发生在启动期那次连接 |
 | `arknights_engine_repair` | 修复引擎 | 280 s | 重试 / 强制重下 / 卡住时恢复；`clean=true` 先 `purge()` 清盘再下 |
 
 宿主对单个入口的上限是 300 s，所以最贵的修复入口取 280 s 留余量。
@@ -233,7 +262,13 @@ max_inline_image_mb = 2       # 内联图片上限（MB），超过则先上传�
 2. 自己跑一次 `adb connect <host:port>` 看是否通；模拟器重启后端口常常会变；
 3. 按错误码区分：`adb.connect_timeout`（连接超时，运行时默认 10 秒）/ `adb.disconnected`
    （曾经连上，掉了）/ `adb.address_missing`（没配地址）；
-4. 改用 `adb_path` 指定你自己的 adb（留空则用 MAA 内置的那一份）。
+4. 改用 `adb_path` 指定你自己的 adb（留空则用 MAA 内置的那一份）；
+5. **MuMu12 / LDPlayer 这类模拟器建议填连接配置**：`adb_connect_config = "MuMuEmulator12"`
+   （MuMu12 常见端口 `16384`，以模拟器里显示的为准）+ `adb_connect_extras` 指向模拟器
+   安装目录，见上面「ADB 配置」。只填 `General` 也可能连上，但这时走的是通用推断
+   （部分模拟器要求指定安装目录才能用自带 adb）；
+6. 断线之后 `arknights_status` 会显示 `state=loaded` + `link_state=disconnected`，
+   最近故障码是 `adb.disconnected` —— 这时才需要重连；`state` 显示 `ready` 就说明链路是好的。
 
 **Q4：`MaaCore.dll` 手动放进去了还是 `failed`。**
 大概率是"命中多份"：同一个核心库同时出现在 `engine_root/` 和 `bin/` 里，运行时会判歧义
@@ -260,6 +295,10 @@ max_inline_image_mb = 2       # 内联图片上限（MB），超过则先上传�
 
 如实列出，不含"计划中"的乐观表述：
 
+- **只支持国服官服**（`client_scope = "cn-official"`）。MaaCore 没有查询客户端类型的 C API，
+  所以这条是**声明**而不是检测：外服/渠道服的表现是资源加载失败
+  （`resource.missing` / `resource.load_rejected` / `instance.create_failed`），
+  那三条文案里会直接写明范围。本版不做多资源分发（体积翻倍，且国服还没在真机上验过）。
 - **OCR 链路未接线。** `arknights_analyze_stage` 在不给 `stage` 时会返回
   `ocr_ok=false` + `ocr_error_code="ocr.not_wired"`，**不会假装识别成功**。
   想分析关卡请显式传 `stage`——这条路径是纯静态知识，不依赖设备。
@@ -286,9 +325,10 @@ python tests/test_contract.py --list # 列出全部用例
 python tests/test_service.py         # 业务层文案 / 推送语义测试
 ```
 
-契约测试共 **92** 条（W26 / A15 / R19 / P28 / X4），覆盖供应链模块的
-下载 / 校验 / 解压 / 并发锁 / 取消 / 脱敏等不变量；业务层 **13** 条（S01–S13），
-覆盖文案分档、推送判据与去重语义。
+契约测试共 **110** 条（W26 / W28–W36 / A15–A18 / R19–R25 / P28 / X4），覆盖供应链模块的
+下载 / 校验 / 解压 / 并发锁 / 取消 / 脱敏等不变量，以及实例选项、连接配置透传、
+会话幂等、断线事件与销毁生命周期（Stop→Destroy→Detach）；业务层 **16** 条（S01–S16），
+覆盖文案分档、推送判据、去重语义与 `data` 出口消毒。
 
 > **发布条件**：上面两条命令的退出码都必须为 0。未实现的用例会被记成"未实现"
 > 而不是"通过"——收集器刻意不让新增用例静默跳过，所以只要"未实现"非 0 就不算通过。

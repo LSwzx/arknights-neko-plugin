@@ -329,6 +329,23 @@ W04 就会红。[FACT] 这不需要 C 编译器，也不需要真 `MaaCore.dll`�
 | W25 | wrapper | ①库里真的没有该文件；②（需样本）32 位 DLL 放 64 位进程；③（需样本）把同目录 opencv/onnx 改名 | ① **必须有可诊断的错误**：裸 `OSError`（含 `winerror`/路径）或 runtime 包装的 `EngineLoadFailed(oserror≠None, symbol=None)` 两者皆可，但**不许吞**；② → `WinError 193`；③ → `WinError 126`，且文案能区分"缺同目录依赖"与"缺系统运行库" | ②③ 需要真实样本，标 **L5 非门禁**；① 必须离线可测 |
 | W26 | adapter（第一层白名单） | 表驱动写任务类型：`Fight`、`Infrast`、**`Recruit`**、`Mall`、`Award`、`Roguelike`、`Copilot`；每次 `await adapter.append_readonly_task(type)` | 全部抛 `TaskNotAllowed(task_type=..., allowlist=READONLY_TASK_TYPES)`；**且 fake lib 的调用计数器为 0**（`AsstAppendTask`/`AsstStart` 都必须是 0）——**"在调用任何 ctypes 之前就被拒"比"抛了异常"重要得多**（防"先点进去再拒绝"）；`READONLY_TASK_TYPES` == **`{Screencap, OperBox, Depot, Debug}`（4 项）** | **这是全项目唯一一处"错了会越过安全边界"的地方**。⚠️ **`Recruit` 归属有冲突**：架构 §3.3 的常量含它，adapter 与主理人指令按"旧实现注释逐字写着严禁 Recruit、参数可触发游戏内确认动作"把它排除 → 我按**拒绝**断（拒绝是唯一安全默认），冲突见 §7.4 |
 | W27 | adapter（第一层白名单） | `Debug` 任务的两个变体：①`mode="ocr"`；②`mode="screenshot"` / 缺省 / `mode=""` | ① 放行（进到 fake lib，计数器 ≥1）；② 抛 `TaskNotAllowed`；`ALLOWED_DEBUG_MODES == frozenset({"ocr"})` | `Debug` 是唯一一个"名字听着只读、参数能改行为"的任务类型；放行任意 mode 等于开了个后门 |
+| W28 | wrapper | 建实例后对 `AsstInstanceOptionKey` 的三项逐一 `set_instance_option`；再喂 `key=0`、C 返回 0、以及**缺符号**的老库 | ① 枚举值与 C 头文件一致 `INVALID=0 / TOUCH_MODE=1 / DEPLOYMENT_WITH_PAUSE=2 / ADB_LITE_ENABLED=3 / KILL_ADB_ON_EXIT=4`；② 绑定签名 `(c_void_p, c_int32, c_char_p)`、`restype == c_ubyte`（value 是**字符串**，不是 bool）；③ 句柄 0 **不发 C 调用**、返回 `False`；④ C 返回 0 只降级为 `False`；缺符号也返回 `False`（绝不 `AttributeError` 打挂装载） | 官方 WPF GUI 建实例后立刻设 `TouchMode` / `AdbLiteEnabled` / `DeploymentWithPause`；一项都不设 = 把这三个开关交给 MaaCore 内部默认值，表现是"截图慢/触摸怪"这种没人能归因的症状 |
+| W29 | wrapper | 12 MiB 的 PNG + `get_image_plan` 三种取值（`auto` / `grow=2` 对照 / `null`） | ① 默认配置（1 MiB 起步、64 MiB 上限、`DEFAULT_MAX_BUFFER_GROW >= 6`）下**能取到**，倍增梯度 `1→2→4→8→16 MiB`；② 对照：`max_buffer_grow=2` 在同一张图上必须失败在 `grow_limit_reached`；③ 天花板：`null` 永远装不下时停在 **64 MiB**，`grow=20` 走 `no_budget_to_grow`（字节上限先撞）、默认 `grow=6` 走 `grow_limit_reached`（次数上限先撞），两者都**不得**分配超过 64 MiB | 旧默认 `max_buffer_grow=2` 只能 1→2→4 MiB，于是"64 MiB 预算还剩 60 MiB"却先撞次数上限报 `grow_limit_reached` —— 用户看到"截图失败"，排查方向被引去 ADB |
+
+**注**：W30–W36 属 **runtime 的连接契约**（不是 wrapper 的 C API 契约），编号沿用 W 组
+是为了与 W28（实例选项）相邻 —— 它们锁的是同一条官方顺序 `Create → SetInstanceOption →
+SetConnectionExtras → Connect`。
+
+| 编号 | 所属模块 | 前置桩 | 断言要点 | 对应的真实故障 |
+|---|---|---|---|---|
+| W30 | runtime（连接） | `bootstrap()` 到 `LOADED`；`connect(config=...)` | ① `config` 原样透传（`fake.connect_configs == ["MuMuEmulator12"]`）；② 边界：**不传** `config` 且端口是 MuMu 默认的 16384 → 仍是 `"General"`（专防"按端口猜模拟器"）；③ 错误输入：空地址 → `AdbAddressMissing` 且 `AsstAsyncConnect` 计数**不变**（校验先于透传） | 写死 `General` → MuMu12 这类必须走 extras 的模拟器"能连但截图慢/不稳"；反过来按端口猜更糟：猜错静默走错路径，表现成"偶发截图失败" |
+| W31 | runtime（连接） | 同 W30；`extras={"path": ...}`；再喂 `{}` / `None` / 让 `AsstSetConnectionExtras` 抛错 | ① C 收到 `(config_name, JSON)` 且 JSON 可 round-trip；`AsstSetConnectionExtras` 的 `call_log` 下标 **小于** `AsstAsyncConnect`；② 边界：空 extras **不下发**（`{}` 与 `None` 都算"没配"）；③ 错误输入：设置 extras 抛错**不许阻断连接**（C 侧本就是 void + 静默 return） | 顺序反了 = MuMu12 连上了但截图很怪；C 侧是 void + 静默 return，我们这边再抛错就等于把"体验项"升级成"连接失败" |
+| W32 | runtime（连接） | 同 W30；反复 `connect` 同参 / 换 address / 换 extras 键序 / 先失败一次再重试 | ① 同参重连 → `AsstAsyncConnect` 计数**不变**、profile 逐字段相等、`adapter.resolution()` 仍是 1920×1080（证明 `_reset_session` 没跑）；② 边界：extras 只是**键序**不同 → 仍算同参（指纹按 key 归一）；③ 换 address → 计数 +1（真重连）；④ 错误输入：失败过一次之后同参也必须真重连（`_drop_session` 已清缓存） | `adapter.connect()` 第一件事是 `_reset_session()`：每点一次重连就把一个**已经拿到分辨率**的好会话拆掉重建，网络慢一点就是"本来好的，点了重连反而没分辨率了"；反之失败后若走短路，会把"掉线"报成"已连接" |
+| W33 | runtime（连接） | 同 W30；`connect_forced()` vs `connect()` 同参对照 | ① `connect_forced()` → `AsstAsyncConnect` 计数 +1（真重连），profile 与首次相等；② 边界（对照）：紧接着普通 `connect()` 同参 → 计数**不变**（证明差别就在 `force`）；③ 错误输入：`force=True` + 空地址 → 仍抛 `AdbAddressMissing`、不发 C 调用、状态不动（**force 只跳过复用，不放松任何校验**） | "假活"设备（`READY` 但截图一直超时、且没有 `Disconnect` 事件）会被幂等短路折成"什么都没发生"，用户只会认为重连按钮坏了 |
+| W34 | runtime（连接） | 同 W30；两个协程 `gather` 同参 `connect`；先跑一次空地址（失败）再并发 | ① 两个并发 connect 只发 **1 次** `AsstAsyncConnect`（互斥锁 + 幂等短路）；② 两个 profile 相等且 `connected=True`；③ `adapter.resolution()` 仍是 1920×1080（没有被任何一次 `_reset_session` 冲掉）；④ 错误输入：先失败一次不卡死连接锁，随后的并发对仍只发 1 次 | 两个 Connect 并发时，后一个会把前一个**正在等**的分辨率事件清空，然后两个一起超时（状态被冲掉） |
+| W35 | runtime（实例选项） | 同 W30；`bootstrap()` 后观察 `AsstSetInstanceOption` 的**次数/键值/下标**；再喂"C 全返回 0" | ① 恰好 3 次，键值集合 `{(TOUCH_MODE,'minitouch'), (ADB_LITE_ENABLED,'1'), (DEPLOYMENT_WITH_PAUSE,'0')}`，value 都是 `str`；② 3 次的下标都 **小于** `AsstAsyncConnect`；③ 错误输入：C 全返回 0 → **不阻断装载**（仍 `LOADED`），`rejected` 如实记三项、`applied` 为空 | 官方顺序是 `Create → SetInstanceOption → Connect`；`TouchMode` 是连接/截图时才被 controller 读走的，**连完再设 = 这一会话白设** |
+| W36 | runtime（连接） | 同 W30；`extras={"path": ...}`；把 `AsstSetConnectionExtras` 换成**显式抛错**的替身；再喂"没配 extras"与"换 address 不传 extras" | ① 成功态 `status_snapshot()['connection_extras']` **精确等于** `{"keys": ["path"], "dispatched": True, "error": None}`，且 `keys` 是 `list`、状态 `READY`；② 边界：不传 extras → 该键是 `None`（**不是** `{}`、也不是 `{"keys": [], ...}`），`AsstSetConnectionExtras` 0 次；③ 错误输入：Python 侧抛错 → `dispatched is False`、`error` 含**异常类名**、**连接仍成功到 `READY`**，日志是 **warning**（含 "extras" / "NOT dispatched"）且**没有 error**；④ 不泄露值：`json.dumps(快照)` 不含 `D:/` / `MuMuPlayer` / `WindowsPath`（只记键名；反证：C 收到的 JSON 里确实有那个路径）；⑤ 重置语义：**真连**才重置（换 address 且不传 extras → 回 `None`），**幂等短路不重置**（同参重连 → 保持上一次的值） | C 侧 `AsstSetConnectionExtras` 返回 `void`、JSON 解析失败也只是静默 return —— "配了 extras 却没生效"永远不会被告知；上一版连 Python 侧的失败也用 `suppress(Exception)` 一起吞掉，于是用户填了 MuMu12 安装目录而 extras 根本没发出去，状态页一片正常，只能靠"截图有点慢"去猜 |
+
 
 ### 3.2 A 组：`tests/test_contract.py` — adapter 的回调 → asyncio 契约
 
@@ -349,6 +366,10 @@ W04 就会红。[FACT] 这不需要 C 编译器，也不需要真 `MaaCore.dll`�
 | A13 | adapter | 回调载荷为 `b"\xff\xfe"`、`b"{not json"`、`None` | 均不抛穿到 C 线程；事件被丢弃并计数 | C 线程里抛异常 = 未定义行为/进程崩 |
 | A14 | adapter | 调用 A 已结束，随后到达 `async_call_id == A` 的迟到事件，再发起调用 B | 迟到事件被**按 id 丢弃**（F21）；B 只收到自己 id 的事件；B 的结果不来自 A | 盲扫队列 + 谓词猜 → "第二次同步"拿到第一轮结果并写进缓存 |
 | A15 | adapter | fake `AsstGetImage` 返回非 PNG 字节（`b"\x00" * 64`，且与 BGR 裸像素**等长**以排除"长度凑巧"） | 抛 `CaptureFormatUnexpected(magic=<首 8 字节>, length=64)`；**原始字节确实落盘**（文件存在、字节逐一相等、长度 64）；落盘路径出现在文案里；**不得尝试二次编码兜底**（断言没有第二次 `imencode`/`PIL`/`cv2` 调用，且上行的是原始字节的落盘路径而不是"修好的 PNG"） | 旧 `maa_adapter.py` 的 docstring 就记着"PNG/RGB 二次编码"这个坑。二次编码会把"库版本不对"变成一个能正常显示的错图，**问题被吃掉且再无复现证据** |
+| A16 | adapter | 挂起的 `capture()`（不发 `AsyncCallInfo(Screencap)`），注入 `Disconnect`；再让挂起的 **Connect** 也吃一次 `Disconnect`；最后注入**不带 why** 的 `Disconnect` | ① 挂起的 `capture()` **立刻**失败：耗时 `< 0.5s`（`capture_timeout=5s`，差一个数量级）；② 异常是 `CaptureFailed`（与 `ret=False` 同一条分支，不新增语义）；③ `AsstGetImage` **零调用**；④ 挂起的 Connect → `AdbDisconnected` 且 `why` 是事件原文；⑤ 缺 why 时 `link_reason` 给中性默认值（含 "disconnect"），**不编造**具体原因 | 没有这条路径时掉线后一次截图要等满 8s 才报"截图卡住了"：宿主 entry 预算几秒必被打穿，而且报的原因（缓冲/超时）把排查引向完全错误的方向 |
+| A17 | adapter | 先注入 `Connected`，再对**挂起**的截图注入 `ScreencapFailed`；再注入一次**无挂起调用**的 `ScreencapFailed`；最后再截一次 | ① 挂起的那次 → `CaptureFailed`；② `link_state` 仍是 `CONNECTED`；③ 无挂起时收到该事件不抛、不改状态、`pending_calls` 仍是 0；④ 随后一次截图**必须成功**（单次失败不许毒化会话） | 把 `ScreencapFailed` 当断线：一次偶发截图失败就把设备判死、要求用户重连（而下一次截图本来就会成功） |
+| A18 | adapter | 先 `Connected`，挂一个截图，再注入 `Reconnecting`，最后 `Reconnected` | ① `link_state == RECONNECTING`、`link_reason` 为事件原文；② `AsstAsyncConnect` 计数 **0**（**不得**补发 Connect）；③ 挂起的截图**不被误杀**（`pending_calls` 仍 1）；④ `Reconnected` → 回 `CONNECTED` 且 `link_reason` 清空 | `LinkState` 的表格写死了"`RECONNECTING` 时不要重发 Connect"：再发一个会和 MAA 自己抢同一个 handle（后一个 `_reset_session` 把前一个正在等的结果清掉） |
+
 
 ### 3.3 R 组：`tests/test_contract.py` — runtime 的引擎供给契约
 
@@ -373,6 +394,13 @@ W04 就会红。[FACT] 这不需要 C 编译器，也不需要真 `MaaCore.dll`�
 | R17 | provision | 静态扫描 `maa/provision.py` 的 AST | 所有 `raise` 节点的异常类型 **⊆ `{EngineDownloadFailed, EngineHashMismatch, EngineUnpackFailed, EngineLayoutInvalid}`**（即 `PROVISION_CODES` 对应的四个类）；**不得**出现自定义新异常（含 `ProvisionError` 之类的中间基类）；`runtime` 只做边界捕获 + 状态落地，**不做异常类型翻译** | 两套异常族 → 必须写翻译层 → 漏映射一条，service 拿到陌生异常走兜底 → 复现旧实现"所有问题都变成 ADB 没连上" |
 | R18 | runtime | state 被置于 `DOWNLOADING`（后台下载中） | 调 `capture()` **快速失败**：抛 `EngineNotReady`，且 `exc.state == "downloading"`（`state` 字段是 `EngineState.value`）；耗时 **< 100ms**；**不得阻塞等待下载**；fake 的 `AsstGetImage` 未被调用。`progress` 字段口径见 §7.4（两处文档不一致，已提请架构收口） | 下载期间一次截图请求就阻塞 → 该 entry 必被宿主超时打穿（295MB 慢网下窗口很长） |
 | R19 | runtime | fake lib 的调用记录器；序列 = `set_user_dir` → `load_resource` → `create_instance` | 调用序号严格递增：`AsstSetUserDir` **先于** `AsstLoadResource` **先于** `AsstCreateEx`；且 `load()`/`bootstrap()` **不得隐式**调 `set_user_dir`（主理人：隐蔽副作用比少一次便利危险） | F18：`AsstLoadResource` 在 UserDir 为空时会把它绑到资源父目录 → MAA 的日志/调试目录被写进资源目录。**编号变更**：原 W21，主理人裁决移到 R 组（属 runtime 编排契约，不是 wrapper 契约） |
+| R20 | runtime | `bootstrap()` 到 `LOADED`；三个变体：①正常销毁；②`FakeMaaCore(destroy_delay=0.5)` + `destroy_timeout=0.05`（卡死）；③`AsstStop` 抛错 | ① **顺序**：`call_log` 里 `AsstStop` 必须**先于** `AsstDestroy`（同一线程顺序执行；分两个线程并发调同一个 handle = 对同一个 C++ 对象 UAF）；② 正常路径（对照）：确认销毁 → `wrapper.close()`（`_lib` 置空）、`detach_calls == 0`、`destroy_abandoned == 0`、无 error 日志；③ 超时放弃：**error 级**日志且文本含 "abandon"、`detach_callback()` 被调用（`callback_attached is False`）、**绝不 `close()`**（`_lib` 仍活）、`destroy_abandoned == 1` + `abandoned_wrappers == 1` + `detach_invocations == 1`、state 收成 `ABSENT`；④ 错误输入：`AsstStop` 抛错**不许**阻止 `AsstDestroy`，也不许记成"放弃"（实例其实已删掉） | `AsstDestroy` = `delete h`，`~Assistant()` 会 join 三条线程且**可能无限阻塞**，而 `Destroyed` 回调是析构的**最后一句** —— "放弃等待"那一刻 C 线程仍可能回调进已拆光的 Python 状态。旧实现只写一句注释，没人能验证 detach 到底有没有发生 |
+| R21 | runtime | ①先 `wrapper.close()` 再 `destroy()`（= 销毁线程唯一真实抛错点：`_require_lib()` 失败）；②替身 wrapper 的 `detach_callback` 为 `None`；③放弃后再 `destroy()` | ① 与超时同性质：**error 级**日志含 "abandon"、`detach_callback` 被调用、`destroy_abandoned == 1`、`abandoned_wrappers == 1`，且 `destroy()` **不抛**（它是 `on_shutdown` 钩子）；② 边界：能力缺失时仍不抛、仍计放弃；③ 幂等：放弃后再 `destroy()` 不抛、`destroy_calls` 不再增长 | `destroy_instance` 抛错意味着 **`AsstDestroy` 根本没发出去**（实例还活着、线程还在跑）。旧实现只记 debug = 把"实例没被销毁"静默吞掉，真机表现成"关不掉的后台线程 / 退出时卡住" |
+| R22 | runtime | ①连续两次 `destroy()`；②`ABSENT` 状态再调一次；③销毁后重新 `bootstrap()` 到新实例再销毁 | ① 一次销毁 `stop_calls == destroy_calls == 1`；② 重复调用 / `ABSENT` 状态调用 → **仍是 1**（不是 2、3），且不抛；③ 重新装载后第二次销毁 → `(2,2)`（计数器口径是"**每个实例**一次"，不是"进程一次"；也不是一次性对象） | `AsstDestroy` 是 `delete handle`，**delete 两次是 UAF**，不是"多删一个空指针"。宿主可能从 `on_shutdown` 与失败清理各调一次 |
+| R23 | runtime | `destroy_delay=0.5` + `destroy_timeout=3`：①`destroy()` 跑到一半时再调一次；②三路 `gather`；③销毁后连打 3 次 | ① 第二次 `destroy()` **立刻返回**（`teardown_in_progress` 闸生效，不排队），`destroy_calls` 仍 1；并发结束后 `(1,1)`、标志落回 0、`destroy_abandoned == 0`；② 三路并发仍是 `(1,1)`；③ 全都无异常 | 没有 `_teardown_in_progress` 时两个协程各发一次 `AsstDestroy` → `delete` 两次 = UAF；而"排队等待"会拖住 `on_shutdown` |
+| R24 | runtime | `READY`（已注入 `Connected`）后注入 `Disconnect`，再读 `health()` / `status_snapshot()`；再读一次；另起一套"从没连过就收到 Disconnect" | ① `health()` 后 `_state` 变 **`LOADED`**、`status_snapshot()['link_state'] == "disconnected"`、`_last_error` 是 `AdbDisconnected` 且 `why` 是事件原文、`health().connected is False`、`device is None`；② 边界：再读一次**不重复构造**异常（`last_error` 是同一对象）；③ 错误输入：没有会话时收到 `Disconnect` → **不许伪造** `AdbDisconnected`（`last_error` 仍 `None`） | 断线后 `_state` 仍是 `READY`、`status` 继续显示"一切就绪"：用户照着"就绪"点截图，然后等满 `capture_timeout` 才拿到"截图卡住了"，而真正原因早就在 `adapter.link_state` 里 |
+| R25 | runtime | `status_snapshot()`；①默认配置；②只覆盖一项 `instance_options`；③塞一个**未知选项名** | ① `client_scope == "cn-official"`；`instance_options` 恰好三档 `requested / applied / rejected`，`applied` 含官方那三项、`rejected` 为空；② 边界：只覆盖一项 → `requested` 是"默认值 + 覆盖"的**合并**结果（其余保持默认），覆盖值真的传到 C；③ 错误输入：未知名字 → 忽略 + **一条 warning**（不抛、不进 `requested`），装载照常 `LOADED` | MaaCore 没有任何 C API 能查"当前连的是哪个客户端"：声明不进诊断字段，外服用户报障就会去反复重启/重下引擎/换端口。"部分设置"比"完全不设置"更难排查 |
+
 
 
 ### 3.4 S 组：`tests/test_service.py` — 异常状态机与猫娘文案
@@ -392,6 +420,10 @@ W04 就会红。[FACT] 这不需要 C 编译器，也不需要真 `MaaCore.dll`�
 | S11 | service | 模拟 `on_startup` 路径（G5 缓解：启动期只存 pending_notice，不 push） | `on_startup` 期间 `push_message` **零调用**；`ctx.images.upload()` **零调用**（该 API 明确禁止在生命周期钩子里调）；补发发生在第一次业务 entry 内 | 钩子里发消息/传图 → 宿主侧不可预期失败，或启动被判 startup-failed |
 | S12 | service | 触发 `TaskNotAllowed`（如用户说"帮我打这一关"） | 文案**不得含"失败/错误/异常"字样**（它是安全边界，不是故障，说"失败"会让用户以为是 bug 而反复重试）；必须含"不代打"这类边界说明；`ai_behavior == "respond"`（要回话解释，不能只 `read`）；`visibility == ("chat",)`；**不写审计日志为 error 级** | 把安全拒绝报成故障 → 用户反复重试，模型还会道歉说自己坏了 |
 | S13 | service | 调 `service.execute_automation(...)`（`logic.py` 的自动化入口） | **必抛 `NotImplementedError`**；**零副作用**：`push_message` 零调用、`upload` 零调用、adapter 的 `run_task` 零调用、`last_error` 不被改写；异常消息含"初版不支持"类说明 | 这是未来自动化的入口。将来有人把它实现成"真能执行"，这条会**立刻红**——比在 PR 里靠人眼盯可靠 |
+| S14 | service | 资源三兄弟（`ResourceMissing` / `ResourceLoadRejected` / `InstanceCreateFailed`），其中 `ResourceMissing` 的 `expected_dir` **故意不在** `searched` 里；另加"searched 为空"与"searched 里混入用户路径"两个变体 | ① 每条都必须含"国服"/"官服"（`[FACT]` 没有任何 C API 能查客户端，声明只能靠文案）；② **不泄露路径**：只有 `searched` / `engine_root` 这两类**刻意**保留项允许出现，`expected_dir` / `resource_parent` / `user_dir` 一个字都不许露面；③ **不泄露原生值**：16 进制指针、`2**64-1` 哨兵、`WindowsPath(...)` 的 repr 全禁；④ 正反对照：原始值仍在 `to_dict()['context']` 里；⑤ **反向**：非资源家族（`AdbDisconnected` / `CaptureTimeout`）**不得**带这句话 | 声明不出现在**用户第一次失败**的那条消息里，等于不存在：外服用户会去反复重启、重下引擎、换端口，全都无效。同时"有那句话"不能变成"顺便把路径也甩出去" |
+| S15 | service | ①带 `connect_forced` 的端口替身；②默认配置 vs 显式 `adb_connect_config`+`adb_connect_extras`；③不带该能力的端口替身 + 强制重连抛 `AdbConnectTimeout` | ① 有 `connect_forced` 就**必须**走它（普通 `connect` 零调用），`diagnostics['forced'] is True`，成功文案带分辨率；② 边界：默认配置**不下发** `config`/`extras`（窄接口纪律），显式配置则原样下发（extras 解析成 dict，诊断只记键不记值）；③ 错误输入：无该能力 → 退回普通 `connect()` 且 `diagnostics['forced'] is False`；抛 `EngineError` → 文案渲染 + 恰好 push 一次 + `error_code` | "用户显式点了重连"必须真重连：设备假活时（`READY` 但截图一直超时、没有 `Disconnect` 事件）会被幂等短路折成"什么都没发生"，用户只会认为按钮坏了 |
+| S16 | service | 假 runtime 的 `status_snapshot()` 里塞 `connection_extras` 的四种形态（成功态 / `dispatched=False` / 带路径的 `error`+路径型键名 / `None`），再走 `handle_status()` → `to_entry_dict()` 读 `data` | ① 成功态原样透传（`dispatched`/`keys` 在），`error=None` **不塞**空字段；② `dispatched=False` 与它的 `error` 原因**必须保留**，且诊断词（`rejected`/`failed`）不被消毒吞掉；③ **路径消毒**：`error` 带 `MaaCallError.detail.library_path`（`WindowsPath('C:/…')` repr）与 `D:/Program Files/…`、`keys` 里塞路径型键名 → `data` 里扫不出绝对路径形态、`.dll`/`MaaCore`/`MuMuPlayer`/`WindowsPath`/`Program Files` 全不出现，但 `dispatched` 仍在、键数量不缩水；④ `None` **保留为 `None`**（不是丢键、不是 `{}`），另加边界"runtime 没报该字段 → `data` 里也不许凭空造一个"，错误输入"非 Mapping → 折成 `None` 不炸" | 这个字段是"配了 MuMu12 却没生效"在用户侧**唯一**可见证据（C 侧 void + 静默 return），但它的两个来源都是外部输入：`error` 来自异常原文（`MaaCallError.detail` 里有 `library_path`），`keys` 来自外部配置（`{"C:\\Users\\me": …}` 这种键名并非不可能）。漏消毒 = 把用户机器目录结构送进状态页/模型；消毒过头（丢掉 `dispatched=False` 或整段 error）= 把泄漏换成了失明 |
+
 
 ### 3.5 X 组：元用例（防"文档与代码漂移"）
 
@@ -1104,6 +1136,15 @@ S13 会立刻红。这条比给静态表写 20 条断言有用。
 | W25 | `test_w25_load_failure_reports_oserror_vs_symbol` | test_contract.py |
 | W26 | `test_w26_write_task_types_rejected_before_any_ctypes_call` | test_contract.py |
 | W27 | `test_w27_debug_task_allowed_only_in_ocr_mode` | test_contract.py |
+| W28 | `test_w28_instance_option_binding_and_returns` | test_contract.py |
+| W29 | `test_w29_4k_image_fits_default_budget` | test_contract.py |
+| W30 | `test_w30_connect_config_is_passed_through_never_guessed` | test_contract.py |
+| W31 | `test_w31_connection_extras_are_set_before_connect` | test_contract.py |
+| W32 | `test_w32_same_params_reuse_session_changed_params_reconnect` | test_contract.py |
+| W33 | `test_w33_forced_connect_skips_reuse_but_not_validation` | test_contract.py |
+| W34 | `test_w34_concurrent_connect_does_not_clobber_session` | test_contract.py |
+| W35 | `test_w35_instance_options_applied_before_connect` | test_contract.py |
+| W36 | `test_w36_connection_extras_failure_is_observable` | test_contract.py |
 | A01 | `test_a01_callback_from_c_thread_enqueues` | test_contract.py |
 | A02 | `test_a02_wakeup_is_event_driven` | test_contract.py |
 | A03 | `test_a03_connected_does_not_return_early` | test_contract.py |
@@ -1119,6 +1160,9 @@ S13 会立刻红。这条比给静态表写 20 条断言有用。
 | A13 | `test_a13_malformed_payload_is_swallowed` | test_contract.py |
 | A14 | `test_a14_stale_events_do_not_satisfy_next_task` | test_contract.py |
 | A15 | `test_a15_non_png_magic_keeps_raw_bytes_and_never_reencodes` | test_contract.py |
+| A16 | `test_a16_disconnect_fails_pending_capture_immediately` | test_contract.py |
+| A17 | `test_a17_screencap_failed_only_fails_that_capture` | test_contract.py |
+| A18 | `test_a18_reconnecting_never_resends_connect` | test_contract.py |
 | R01 | `test_r01_hash_mismatch_deletes_file` | test_contract.py |
 | R02 | `test_r02_partial_download_is_not_usable` | test_contract.py |
 | R03 | `test_r03_zip_slip_is_rejected` | test_contract.py |
@@ -1138,6 +1182,12 @@ S13 会立刻红。这条比给静态表写 20 条断言有用。
 | R17 | `test_r17_provision_raises_only_known_errors` | test_contract.py |
 | R18 | `test_r18_capture_fails_fast_while_downloading` | test_contract.py |
 | R19 | `test_r19_user_dir_before_load_resource` | test_contract.py |
+| R20 | `test_r20_destroy_stops_before_destroy_and_abandons_on_timeout` | test_contract.py |
+| R21 | `test_r21_destroy_thread_failure_is_treated_as_abandoned` | test_contract.py |
+| R22 | `test_r22_destroy_is_idempotent` | test_contract.py |
+| R23 | `test_r23_concurrent_destroy_sends_one_delete` | test_contract.py |
+| R24 | `test_r24_health_converges_after_disconnect` | test_contract.py |
+| R25 | `test_r25_status_snapshot_declares_client_scope_and_instance_options` | test_contract.py |
 | S01 | `test_s01_each_exception_has_unique_copy` | test_service.py |
 | S02 | `test_s02_copy_gives_actionable_next_step` | test_service.py |
 | S03 | `test_s03_unknown_exception_falls_back_cleanly` | test_service.py |
@@ -1151,6 +1201,9 @@ S13 会立刻红。这条比给静态表写 20 条断言有用。
 | S11 | `test_s11_lifecycle_never_pushes` | test_service.py |
 | S12 | `test_s12_task_not_allowed_copy_has_no_failure_wording` | test_service.py |
 | S13 | `test_s13_execute_automation_raises_not_implemented_without_side_effects` | test_service.py |
+| S14 | `test_s14_resource_copy_declares_cn_official_scope` | test_service.py |
+| S15 | `test_s15_reconnect_uses_forced_capability_and_never_downgrades` | test_service.py |
+| S16 | `test_s16_connection_extras_are_sanitized_before_entry_data` | test_service.py |
 | X01 | `test_x01_case_ids_match_plan_doc` | test_contract.py |
 | X02 | `test_x02_no_test_function_left_unregistered` | test_contract.py |
 | X03 | `test_x03_service_import_direction` | test_contract.py |

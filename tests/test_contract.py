@@ -920,6 +920,938 @@ async def _connect_ok(adapter, fake, *, events_before=(), address="127.0.0.1:555
     return await asyncio.wait_for(task, 2.0)
 
 
+@case("W28", "wrapper", "instance-options")
+def test_w28_instance_option_binding_and_returns():
+    """W28 · `AsstSetInstanceOption` 的绑定与机械返回值（官方 GUI 建实例后的第二件事）。
+
+    真实风险（外部评审指出的"截图慢/触摸怪"）：官方 WPF 代理建实例后立刻设
+    `TouchMode` / `AdbLiteEnabled` / `DeploymentWithPause`；我们一项都没设，
+    等于把这三个开关交给 MaaCore 内部默认值。
+
+    断言四件事：
+      ① 枚举值必须与 C 头文件一致（写错一位 = 静默改错开关）；
+      ② 绑定签名：key 是 `c_int32`、value 是 `c_char_p`（**不是 bool**）；
+      ③ 句柄 0 时**不发 C 调用**，返回 False（与 `destroy_instance(0)` 同一条纪律）；
+      ④ 符号缺失 / C 返回 0 都只降级为 False，**不许抛** —— 这是体验项，不是装载前提。
+    """
+    import ctypes
+
+    W = _wrapper_mod()
+    K = getattr(W, "AsstInstanceOptionKey", None)
+    assert K is not None, "wrapper 未导出 AsstInstanceOptionKey（实例选项没法按名设置）"
+    got = (K.INVALID, K.TOUCH_MODE, K.DEPLOYMENT_WITH_PAUSE, K.ADB_LITE_ENABLED, K.KILL_ADB_ON_EXIT)
+    assert got == (0, 1, 2, 3, 4), f"AsstInstanceOptionKey 与 C 头文件不一致：{got}"
+
+    with _tmpdir() as tmp:
+        w, fake = _loaded(tmp)
+        fn = fake.f("AsstSetInstanceOption")
+        assert fn.restype is ctypes.c_ubyte, f"restype 应为 c_ubyte，实际 {fn.restype!r}"
+        assert fn.argtypes == (ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p), (
+            f"argtypes 不对：{fn.argtypes!r} —— key 必须是 int32、value 必须是 char_p"
+        )
+
+        handle = w.create_instance()
+        assert w.set_instance_option(0, K.TOUCH_MODE, "minitouch") is False, (
+            "句柄 0 必须返回 False"
+        )
+        assert fake.calls_of("AsstSetInstanceOption") == 0, (
+            "句柄 0 时仍然调进了 C（应该像 destroy_instance(0) 一样直接短路）"
+        )
+
+        assert w.set_instance_option(handle, K.TOUCH_MODE, "minitouch") is True
+        assert fake.instance_options == [(int(K.TOUCH_MODE), "minitouch")], (
+            f"传下去的不是 (key_int, value_str)：{fake.instance_options!r}"
+        )
+        assert all(isinstance(v, str) for _k, v in fake.instance_options), (
+            "value 被转成了非字符串 —— C 侧自己 parse 字符串，传 bool 会静默失效"
+        )
+
+    # C 返回 0：如实返回 False，不抛
+    with _tmpdir() as tmp:
+        w, fake = _loaded(tmp, instance_option_returns=0)
+        handle = w.create_instance()
+        assert w.set_instance_option(handle, K.ADB_LITE_ENABLED, "1") is False
+
+    # 老版本库没有这个符号：必须降级，不许 AttributeError 把装载打挂
+    with _tmpdir() as tmp:
+        w, fake = _loaded(tmp, F.MissingSymbolsFake({"AsstSetInstanceOption"}))
+        handle = w.create_instance()
+        kind, value = _outcome(lambda: w.set_instance_option(handle, K.ADB_LITE_ENABLED, "1"))
+        assert kind == "value", f"缺符号时抛了 {value!r}（应该只返回 False）"
+        assert value is False, f"缺符号时应返回 False，实际 {value!r}"
+
+
+@case("W29", "wrapper", "image-buffer")
+def test_w29_4k_image_fits_default_budget():
+    """W29 · 4K / HDR 量级的 PNG 必须能在**默认上限**下取到（云测要求的边界）。
+
+    算账：`AsstGetImage` 出的是 PNG。1080p 的游戏界面通常 0.5–2 MiB，
+    **4K（3840×2160）在高对比/HDR 画面下可以到 8–20 MiB**。
+    旧默认 `max_buffer_grow = 2` 只能 1→2→4 MiB，于是"64 MiB 预算还剩 60 MiB"
+    却先撞次数上限报 `grow_limit_reached` —— 用户看到的是"截图失败"，
+    排查方向会被引到 ADB 上去（这正是旧实现最坏的那类误导）。
+
+    三段断言，缺一不可：
+      ① 12 MiB 的 PNG 在默认配置下**能取到**，且倍增梯度是 1→2→4→8→16 MiB；
+      ② 对照组：同样 12 MiB，`max_buffer_grow=2` 必须失败在 `grow_limit_reached`
+         —— 证明"改默认值"不是换个数字，而是修掉一个真实失败；
+      ③ 天花板仍然是 **64 MiB**：永远装不下时，停在 64 MiB 报 `no_budget_to_grow`，
+         绝不允许继续倍增（畸形大图不许吃满内存）。
+    """
+    W = _wrapper_mod()
+    assert W.DEFAULT_IMAGE_BUFFER_BYTES == 1 << 20, (
+        f"初始缓冲应为 1 MiB，实际 {W.DEFAULT_IMAGE_BUFFER_BYTES}"
+    )
+    assert W.DEFAULT_MAX_IMAGE_BUFFER_BYTES == 64 << 20, (
+        f"字节上限应为 64 MiB，实际 {W.DEFAULT_MAX_IMAGE_BUFFER_BYTES}"
+    )
+    assert W.DEFAULT_MAX_BUFFER_GROW >= 6, (
+        "倍增次数不足以从 1 MiB 走到 64 MiB："
+        f"grow={W.DEFAULT_MAX_BUFFER_GROW} 时 4K PNG 会先撞次数上限"
+    )
+
+    payload = W.PNG_SIGNATURE + b"\x00" * ((12 << 20) - len(W.PNG_SIGNATURE))
+
+    # ① 默认配置：必须成功
+    with _tmpdir() as tmp:
+        # ``_make_wrapper`` 返回三元组 ``(wrapper, fake, libdir)`` —— 这里必须解三个。
+        # （历史 bug：写成两元组解包 → ``ValueError: too many values to unpack``，
+        #  用例从来没跑到过断言，等于这条边界一直没人守。）
+        w, fake, libdir = _make_wrapper(
+            tmp,
+            payload=payload,
+            get_image_plan=["auto"],
+            max_image_buffer_bytes=W.DEFAULT_MAX_IMAGE_BUFFER_BYTES,
+            max_buffer_grow=W.DEFAULT_MAX_BUFFER_GROW,
+        )
+        w.load(dll_directory=libdir)
+        handle = w.create_instance()
+        data = w.get_image(handle)
+        assert len(data) == len(payload), f"取到的字节数不对：{len(data)} != {len(payload)}"
+        assert data.startswith(W.PNG_SIGNATURE), "取到的不是 PNG 原样字节"
+        assert fake.image_buff_sizes == [1 << 20, 2 << 20, 4 << 20, 8 << 20, 16 << 20], (
+            f"倍增梯度不对：{fake.image_buff_sizes}"
+        )
+
+    # ② 对照组：旧默认（grow=2）在同一张图上必定失败
+    with _tmpdir() as tmp:
+        w, fake, libdir = _make_wrapper(
+            tmp,
+            payload=payload,
+            get_image_plan=["auto"],
+            max_image_buffer_bytes=W.DEFAULT_MAX_IMAGE_BUFFER_BYTES,
+            max_buffer_grow=2,
+        )
+        w.load(dll_directory=libdir)
+        handle = w.create_instance()
+        kind, value = _outcome(lambda: w.get_image(handle))
+        assert kind == "error", "grow=2 竟然取到了 12 MiB 的图 —— 对照组的结论不成立"
+        assert _is_maa_call_error(value), f"错误类型不对：{type(value).__name__}: {value}"
+        reason = getattr(value, "detail", {}).get("reason")
+        assert reason == "grow_limit_reached", f"失败原因应是次数上限，实际 {reason!r}"
+
+    # ③ 天花板：永远装不下时停在 64 MiB，不许越过。
+    #    两个上限谁先撞到，取决于 grow 的取值 —— 两条都必须走一遍，否则"64 MiB 是**字节**
+    #    上限"这句话其实是靠 grow 的次数上限间接成立的（默认 grow=6 正好够走到 64 MiB，
+    #    于是字节上限那条分支永远不被执行）。旧写法只断 reason == "no_budget_to_grow"，
+    #    在默认 grow=6 下必然红：这不是生产 bug（行为是对的：停在 64 MiB），
+    #    而是断言把"哪一种上限生效"写死了。
+    for grow, want_reason, why in (
+        (20, "no_budget_to_grow", "grow 足够多 → 必须是**字节**上限先撞（64 MiB 是硬墙）"),
+        (W.DEFAULT_MAX_BUFFER_GROW, "grow_limit_reached",
+         "默认 grow=6 正好走到 64 MiB → 次数上限先撞，同样必须停在 64 MiB"),
+    ):
+        with _tmpdir() as tmp:
+            w, fake, libdir = _make_wrapper(
+                tmp,
+                payload=payload,
+                get_image_plan=["null"],
+                max_image_buffer_bytes=W.DEFAULT_MAX_IMAGE_BUFFER_BYTES,
+                max_buffer_grow=grow,
+            )
+            w.load(dll_directory=libdir)
+            handle = w.create_instance()
+            kind, value = _outcome(lambda: w.get_image(handle))
+            assert kind == "error", (
+                f"永远返回哨兵却成功了？（grow={grow}）—— 那会把一坨零字节当图像交上去"
+            )
+            assert _is_maa_call_error(value), f"错误类型不对：{type(value).__name__}: {value}"
+            reason = getattr(value, "detail", {}).get("reason")
+            assert reason == want_reason, (
+                f"grow={grow} 时失败原因应为 {want_reason!r}（{why}），实际 {reason!r}"
+            )
+            assert fake.image_buff_sizes, "一次 AsstGetImage 都没发出去？"
+            assert max(fake.image_buff_sizes) == W.DEFAULT_MAX_IMAGE_BUFFER_BYTES, (
+                f"grow={grow}：最大一次分配应正好 64 MiB（停在硬墙上），"
+                f"实际 {max(fake.image_buff_sizes)}"
+            )
+            assert all(s <= W.DEFAULT_MAX_IMAGE_BUFFER_BYTES for s in fake.image_buff_sizes), (
+                f"grow={grow}：分配越过了 64 MiB 硬上限：{fake.image_buff_sizes} —— "
+                "畸形大图能把进程 OOM"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# C 组：连接参数透传 / 会话复用（W30–W35）
+# --------------------------------------------------------------------------- #
+# 三条公共约定（本组共用）：
+#   1. 事件一律走 `runtime._on_raw_event(...)` —— 这是 C++ 线程回调进 Python 的
+#      **唯一**入口（与 A 组用 `adapter._on_thread_event` 同一套东西，只是上面多一层）。
+#   2. **不 sleep 等结果**：用 `_rt_pending()` 等"挂起调用已注册"这个可观测条件。
+#   3. 判据只认可观测事实：`fake.call_log` / `fake.calls_of(...)` / `connect_configs` /
+#      `connection_extras` / `status_snapshot()` / `adapter.resolution()`。
+
+
+def _runtime_fake(env, fake=None, **over):
+    """`(runtime, fake)`：`wrapper_factory` 只换掉 CDLL 那一层，其余全是真的。"""
+    fake = F.FakeMaaCore() if fake is None else fake
+    factory = _fake_factory(fake)
+    rt = _runtime(env, _release(_engine_zip()), wrapper_factory=factory, **over)
+    return rt, fake
+
+
+async def _rt_loaded(env, fake=None, **over):
+    """摆好布局 + `bootstrap()` 到 `LOADED`（连接类用例的统一前置）。"""
+    M = _runtime_mod()
+    _install_layout(env.engine_root)
+    rt, fake = _runtime_fake(env, fake, **over)
+    state = await rt.bootstrap()
+    assert state is M.EngineState.LOADED, (
+        f"前置失败：布局完整的引擎应装载到 LOADED，实际 {state}（last_error={rt.last_error!r}）"
+    )
+    return rt, fake
+
+
+async def _rt_pending(rt, want=1, *, what="", timeout=3.0):
+    """等 adapter 的挂起调用数到达 `want`（**不 sleep**，等可观测条件）。"""
+    await _until(
+        lambda: rt.adapter.stats().pending_calls == want,
+        timeout=timeout,
+        what=what or f"挂起调用数 == {want}（实际 {rt.adapter.stats().pending_calls}）",
+    )
+
+
+def _rt_event(rt, payload) -> None:
+    """模拟 MaaCore 的 C++ 线程投递一条事件。"""
+    rt._on_raw_event(0, json.dumps(payload), None)
+
+
+async def _rt_connect(rt, fake, *, address="127.0.0.1:5555", forced=False,
+                      resolution=(1920, 1080), uuid="emu-9999", **kw):
+    """跑一次**成功**连接：发号 → 注 `Connected` / `ResolutionGot` / `AsyncCallInfo(ret=True)`。"""
+    fn = rt.connect_forced if forced else rt.connect
+    task = asyncio.ensure_future(fn(address=address, **kw))
+    await _rt_pending(rt, 1, what=f"connect 的 async call 已注册（address={address}）")
+    _rt_event(rt, {"what": "Connected", "details": {}, "uuid": uuid})
+    _rt_event(
+        rt,
+        {
+            "what": "ResolutionGot",
+            "details": {"details": {"width": resolution[0], "height": resolution[1]}},
+        },
+    )
+    _rt_event(
+        rt,
+        {
+            "what": "AsyncCallInfo",
+            "async_call_id": fake.connect_returns,
+            "details": {"ret": True, "cost": 12},
+        },
+    )
+    return await asyncio.wait_for(task, 5.0)
+
+
+async def _rt_connect_fails(rt, fake, *, address="127.0.0.1:5555", why="adb refused"):
+    """跑一次**失败**连接（`ret=False`），返回异常对象。"""
+    task = asyncio.ensure_future(rt.connect(address=address))
+    await _rt_pending(rt, 1, what="失败连接的 async call 已注册")
+    _rt_event(
+        rt,
+        {
+            "what": "AsyncCallInfo",
+            "async_call_id": fake.connect_returns,
+            "details": {"ret": False, "error": why, "cost": None},
+        },
+    )
+    kind, value = await _aoutcome(asyncio.wait_for(task, 5.0))
+    assert kind == "error", f"`ret=False` 却连接成功了：{value!r}"
+    return value
+
+
+@case("W30", "runtime", "connect-config")
+async def test_w30_connect_config_is_passed_through_never_guessed():
+    """W30 · `config` 原样透传给 `AsstAsyncConnect` 的第 4 参数；**绝不按端口猜模拟器**。
+
+    真实风险：不同模拟器要走完全不同的连接路径（MuMu12 必须走 extras 的 ``path``）。
+    把 ``config`` 写死 ``General`` ⇒ "能连上但截图慢/不稳"，用户与模型都会去查 ADB 端口。
+    反过来"看见 16384 就猜 MuMu"更糟：端口既可能是 MuMu 也可能是别人转发的，猜错就
+    静默走错路径（表现为偶发截图失败）。
+
+    三段：
+      ① 显式 ``config="MuMuEmulator12"`` → C 侧收到的就是它（不是 ``General``）；
+      ② 边界：**不传** ``config``、且端口是 MuMu 的默认 16384 → 仍必须是 ``General``
+         （这条专防"按 address 猜"回归）；
+      ③ 错误输入：空地址 → `AdbAddressMissing`，**一次 C 调用都不发**（校验先于透传）。
+    """
+    M = _runtime_mod()
+    E = _errors_mod()
+    with _tmpdir() as tmp:
+        env = _env(tmp)
+        rt, fake = await _rt_loaded(env)
+        try:
+            assert fake.connect_configs == [], (
+                f"还没调用 connect 就把 config 传下去了：{fake.connect_configs!r}"
+            )
+
+            # ① 显式配置名
+            profile = await _rt_connect(rt, fake, config="MuMuEmulator12")
+            assert fake.connect_configs == ["MuMuEmulator12"], (
+                "C 侧收到的连接配置不对："
+                f"{fake.connect_configs!r}（期望 ['MuMuEmulator12']）—— "
+                "config 不是被写死成 General，就是根本没往下传"
+            )
+            assert profile.connected is True, f"连上了但 profile 说没连上：{profile!r}"
+            assert rt.state is M.EngineState.READY, f"连上后状态应为 READY，实际 {rt.state}"
+
+            # ② 边界：MuMu 的默认端口 + 不传 config → 不许猜成 MuMuEmulator12
+            await _rt_connect(rt, fake, address="127.0.0.1:16384")
+            assert fake.connect_configs[-1] == "General", (
+                "端口 16384 被猜成了别的连接配置："
+                f"{fake.connect_configs[-1]!r}。猜模拟器比不猜更糟 —— "
+                "猜错会静默走错连接路径，表现成'偶发截图失败'"
+            )
+
+            # ③ 错误输入：空地址必须在任何 C 调用之前被拒
+            before_calls = fake.calls_of("AsstAsyncConnect")
+            before_configs = list(fake.connect_configs)
+            kind, value = await _aoutcome(rt.connect(address="   "))
+            assert kind == "error", f"空地址竟然连上了：{value!r}"
+            assert isinstance(value, E.AdbAddressMissing), (
+                f"空地址应抛 AdbAddressMissing，实际 {type(value).__name__}: {value}"
+            )
+            assert fake.calls_of("AsstAsyncConnect") == before_calls, (
+                "地址没配却已经调了 AsstAsyncConnect —— 校验必须排在透传之前"
+            )
+            assert fake.connect_configs == before_configs, "被拒绝的请求也把 config 记进去了"
+        finally:
+            await rt.destroy()
+
+
+@case("W31", "runtime", "connect-extras")
+async def test_w31_connection_extras_are_set_before_connect():
+    """W31 · `extras` 先 `AsstSetConnectionExtras(config, json)`、**再** `AsstAsyncConnect`。
+
+    顺序不能反：C 侧是在 ``connect`` 里读这张表的，连完再设等于没设（MuMu12 就会
+    "连上了但截图很怪"）。这条只能用 `fake.call_log` 的**下标**断言。
+
+    三段：
+      ① 正常：`extras={"path": ...}` → C 收到 (config_name, JSON) 且可 round-trip；
+         `AsstSetConnectionExtras` 的下标 **小于** `AsstAsyncConnect`；
+      ② 边界：`extras={}` / `None` → **不下发**（空表下发等于把默认值当用户配置）；
+      ③ 错误输入：`AsstSetConnectionExtras` 抛错 → **不许阻断连接**（C 侧本就是
+         void + 静默 return，我们也不能因为一个体验项把连接判死）。
+    """
+    M = _runtime_mod()
+    with _tmpdir() as tmp:
+        env = _env(tmp)
+        rt, fake = await _rt_loaded(env)
+        try:
+            # ① 正常路径 + 顺序
+            extras = {"path": "D:/Netease/MuMuPlayer-12.0"}
+            await _rt_connect(rt, fake, config="MuMuEmulator12", extras=extras)
+            assert len(fake.connection_extras) == 1, (
+                f"AsstSetConnectionExtras 应被调用 1 次，实际 {fake.connection_extras!r}"
+            )
+            name, payload = fake.connection_extras[0]
+            assert name == "MuMuEmulator12", (
+                f"extras 的名字应是 config 名，实际 {name!r}（传错名字 = C 侧查不到这张表）"
+            )
+            assert json.loads(payload) == extras, (
+                f"extras 的 JSON 不能 round-trip 回原 dict：{payload!r}"
+            )
+            i_extras = fake.index_of("AsstSetConnectionExtras")
+            i_connect = fake.index_of("AsstAsyncConnect")
+            assert i_extras >= 0 and i_connect >= 0, "调用日志里缺符号，顺序无法判定"
+            assert i_extras < i_connect, (
+                f"顺序反了：AsstSetConnectionExtras@{i_extras} / AsstAsyncConnect@{i_connect}。"
+                "C 侧在 connect 里才读 extras，set 晚了等于没设"
+            )
+
+            # ② 边界：空 extras 不下发
+            #    两段用**不同地址**是必须的：`extras={}` 与 `extras=None` 归一后是同一个
+            #    指纹（都是空元组），同地址会命中幂等短路 —— 那就测不到"AsstSetConnectionExtras
+            #    有没有被调用"，测到的是"短路生效了"（另一件事，W32 已经锁住）。
+            before = len(fake.connection_extras)
+            await _rt_connect(rt, fake, address="127.0.0.1:16385", extras={})
+            assert len(fake.connection_extras) == before, (
+                "空 extras 也下发了 —— 那会把'用户没配'变成'配了个空表'"
+            )
+            await _rt_connect(rt, fake, address="127.0.0.1:16386", extras=None)
+            assert len(fake.connection_extras) == before, "extras=None 也下发了"
+
+            # ③ 错误输入：C 侧抛错不阻断连接
+            def _boom(_name, _value):
+                raise RuntimeError("AsstSetConnectionExtras exploded")
+
+            fake.f("AsstSetConnectionExtras")._impl = _boom
+            profile = await _rt_connect(
+                rt, fake, address="127.0.0.1:16387", extras={"path": "X:/y"}
+            )
+            assert profile.connected is True, (
+                "extras 设置失败把连接判死了 —— 它只是体验项，C 侧对坏 JSON 也只是静默 return"
+            )
+            assert rt.state is M.EngineState.READY, f"连接成功后状态应是 READY，实际 {rt.state}"
+        finally:
+            await rt.destroy()
+
+
+@case("W32", "runtime", "session-reuse")
+async def test_w32_same_params_reuse_session_changed_params_reconnect():
+    """W32 · 幂等短路：同参连接**不再发** `AsstAsyncConnect`，且会话状态不许被冲掉。
+
+    不改会怎样：`adapter.connect()` 第一件事是 `_reset_session()`，它把分辨率/uuid/链路
+    全部清空。于是"再点一次重连"会把一个**已经拿到分辨率**的好会话拆掉重建 ——
+    网络慢一点就表现成"本来好的，点了重连反而没分辨率了"。
+
+    四段（每段都是可观测事实，不靠时序）：
+      ① 同参重连 → `AsstAsyncConnect` 计数**不变**，返回的 profile 与首次相等，
+         且 `adapter.resolution()` 仍是首次的 1920×1080（证明 `_reset_session` 没跑）；
+      ② 边界：`extras` 只是**键序**不同 → 仍算同参（指纹按 key 排序归一）；
+      ③ 参数变了（换 address）→ 必须真重连（计数 +1）；
+      ④ 错误输入：上一次连接**失败**过 → 缓存必须已被丢弃，同样参数也要真重连
+         （否则会把"掉线"当成"已连接"交出去）。
+    """
+    A = _adapter_mod()
+    M = _runtime_mod()
+    with _tmpdir() as tmp:
+        env = _env(tmp)
+        rt, fake = await _rt_loaded(env)
+        try:
+            first = await _rt_connect(rt, fake)
+            calls = fake.calls_of("AsstAsyncConnect")
+            assert calls == 1, f"首次连接应恰好 1 次 AsstAsyncConnect，实际 {calls}"
+            first_res = rt.adapter.resolution()
+            assert first_res.status is A.ResolutionStatus.KNOWN, (
+                f"首次连接后分辨率应是 KNOWN，实际 {first_res!r}"
+            )
+
+            # ① 幂等短路
+            again = await rt.connect(address="127.0.0.1:5555", adb_path="", config="General")
+            assert fake.calls_of("AsstAsyncConnect") == calls, (
+                "同参重连又发了一次 AsstAsyncConnect（幂等短路失效）—— "
+                "每点一次重连就把好会话拆一次"
+            )
+            assert again == first, (
+                f"短路返回的 profile 与首次不一致：{again!r} != {first!r}"
+            )
+            assert rt.adapter.resolution() == first_res, (
+                "短路路径把分辨率冲掉了："
+                f"{rt.adapter.resolution()!r} != {first_res!r}（`_reset_session` 跑过了）"
+            )
+            assert rt.state is M.EngineState.READY
+
+            # ② 边界：extras 键序不同仍算同参
+            await _rt_connect(rt, fake, extras={"a": "1", "b": "2"})
+            after_extras = fake.calls_of("AsstAsyncConnect")
+            assert after_extras == calls + 1, (
+                f"新增 extras 属于参数变化，应真重连（计数 {calls}→{calls + 1}），"
+                f"实际 {after_extras}"
+            )
+            await rt.connect(
+                address="127.0.0.1:5555", extras={"b": "2", "a": "1"}
+            )
+            assert fake.calls_of("AsstAsyncConnect") == after_extras, (
+                "同参但 extras 键序不同就真重连了 —— 指纹没有按 key 归一，"
+                "两次解析配置的键序不同会让幂等短路形同虚设"
+            )
+
+            # ③ 换了 address → 用户要换设备，必须真重连
+            await _rt_connect(rt, fake, address="127.0.0.1:6666")
+            assert fake.calls_of("AsstAsyncConnect") == after_extras + 1, (
+                "换了 address 却走了幂等短路 —— 等于无视用户改了设备地址"
+            )
+
+            # ④ 错误输入：失败过之后，同参也必须真重连
+            #    用一个**新地址**：和刚成功的 6666 同参会被幂等短路（那测的是短路，
+            #    不是"失败后缓存是否被丢弃"）。
+            boom = await _rt_connect_fails(rt, fake, address="127.0.0.1:7777")
+            assert _is_engine_error(boom, "AdbDisconnected"), (
+                f"ret=False 应抛 AdbDisconnected，实际 {type(boom).__name__}: {boom}"
+            )
+            assert rt.state is M.EngineState.LOADED, (
+                f"连接失败后应停在 LOADED（可重试），实际 {rt.state}"
+            )
+            before_retry = fake.calls_of("AsstAsyncConnect")
+            await _rt_connect(rt, fake, address="127.0.0.1:7777")
+            assert fake.calls_of("AsstAsyncConnect") == before_retry + 1, (
+                "失败之后同参连接被短路了 —— 会把'掉线'当'已连接'交出去（status 显示已连上）"
+            )
+        finally:
+            await rt.destroy()
+
+
+@case("W33", "runtime", "connect-force")
+async def test_w33_forced_connect_skips_reuse_but_not_validation():
+    """W33 · `connect_forced()` = `connect(force=True)`：同参也真重连，但**不放松**任何校验。
+
+    语义是"用户显式点了重连"：设备可能"假活"（`READY` 但截图一直超时、且没有
+    `Disconnect` 事件），这时幂等短路会让按钮看起来没反应。
+
+    三段：
+      ① 正常：同参 `connect_forced()` → `AsstAsyncConnect` 计数 +1（真重连）；
+      ② 边界（对照组）：紧接着普通 `connect()` 同参 → 计数**不变**（证明差别就在 force，
+         而不是"第二次总会重连"）；
+      ③ 错误输入：`force=True` + 空地址 → 仍抛 `AdbAddressMissing`、仍不发 C 调用；
+         状态不许因为"强制"而被动过。
+    """
+    M = _runtime_mod()
+    E = _errors_mod()
+    with _tmpdir() as tmp:
+        env = _env(tmp)
+        rt, fake = await _rt_loaded(env)
+        try:
+            first = await _rt_connect(rt, fake)
+            calls = fake.calls_of("AsstAsyncConnect")
+            assert calls == 1, f"首次连接应恰好 1 次 AsstAsyncConnect，实际 {calls}"
+
+            # ① 强制重连
+            forced = await _rt_connect(rt, fake, forced=True)
+            assert fake.calls_of("AsstAsyncConnect") == calls + 1, (
+                "connect_forced() 被幂等短路了："
+                f"AsstAsyncConnect 计数仍是 {fake.calls_of('AsstAsyncConnect')}。"
+                "用户点重连时'什么都没发生'只会让他认为按钮坏了"
+            )
+            assert forced == first, (
+                f"同参重连的 profile 应与首次一致（不是新造一份假的）：{forced!r} != {first!r}"
+            )
+
+            # ② 对照组：普通 connect 同参必须短路
+            await rt.connect(address="127.0.0.1:5555")
+            assert fake.calls_of("AsstAsyncConnect") == calls + 1, (
+                "普通 connect 同参也真重连了 —— 那 force 就没有存在意义（且每次重试都拆会话）"
+            )
+
+            # ③ 强制 ≠ 放松校验
+            before = fake.calls_of("AsstAsyncConnect")
+            kind, value = await _aoutcome(rt.connect_forced(address=""))
+            assert kind == "error", f"空地址竟然连上了：{value!r}"
+            assert isinstance(value, E.AdbAddressMissing), (
+                f"force=True 时地址校验被跳过了：抛的是 {type(value).__name__}: {value}"
+            )
+            assert fake.calls_of("AsstAsyncConnect") == before, (
+                "被拒绝的强制重连仍然调了 AsstAsyncConnect"
+            )
+            assert rt.state is M.EngineState.READY, (
+                f"一次被拒的强制重连不该动状态，实际 {rt.state}"
+            )
+        finally:
+            await rt.destroy()
+
+
+@case("W34", "runtime", "connect-concurrent")
+async def test_w34_concurrent_connect_does_not_clobber_session():
+    """W34 · 两个并发 `connect()` 不许把前一个正在等的会话状态冲掉。
+
+    真实故障：`adapter.connect()` 的第一件事是 `_reset_session()`（清分辨率/uuid/链路）。
+    两个 Connect 并发时，后一个会把前一个**正在等**的分辨率事件清空，然后两个一起超时。
+
+    断言（全部是稳定可复现的事实，不靠时序）：
+      ① 两个同参并发 connect → `AsstAsyncConnect` 只发 **1 次**（第二个被互斥锁排到
+         第一个完成之后，并命中幂等短路）；
+      ② 两个返回的 profile 相等，且都 `connected=True`；
+      ③ `adapter.resolution()` 仍是 1920×1080（没有被任何一次 `_reset_session` 冲掉）；
+      ④ 错误输入：先跑一次空地址（失败）→ 锁必须被释放，随后的并发对仍然只发 1 次
+         —— 一次失败的连接不许把连接锁卡死。
+    """
+    A = _adapter_mod()
+    M = _runtime_mod()
+    with _tmpdir() as tmp:
+        env = _env(tmp)
+        rt, fake = await _rt_loaded(env)
+        try:
+            # ④（先跑错误输入）空地址失败 → 锁释放
+            kind, value = await _aoutcome(rt.connect(address=""))
+            assert kind == "error" and type(value).__name__ == "AdbAddressMissing", (
+                f"空地址应抛 AdbAddressMissing，实际 {kind}: {value!r}"
+            )
+            assert fake.calls_of("AsstAsyncConnect") == 0, "空地址也发号了"
+
+            t1 = asyncio.ensure_future(rt.connect(address="127.0.0.1:5555"))
+            t2 = asyncio.ensure_future(rt.connect(address="127.0.0.1:5555"))
+            await _rt_pending(rt, 1, what="并发 connect 里只有 1 个真正发号（互斥锁生效）")
+            _rt_event(rt, {"what": "Connected", "details": {}, "uuid": "emu-9999"})
+            _rt_event(
+                rt,
+                {"what": "ResolutionGot", "details": {"details": {"width": 1920, "height": 1080}}},
+            )
+            _rt_event(
+                rt,
+                {
+                    "what": "AsyncCallInfo",
+                    "async_call_id": fake.connect_returns,
+                    "details": {"ret": True, "cost": 7},
+                },
+            )
+            r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), 5.0)
+
+            calls = fake.calls_of("AsstAsyncConnect")
+            assert calls == 1, (
+                f"两个同参并发 connect 发了 {calls} 次 AsstAsyncConnect（期望 1 次）。"
+                "第二次要么撞了未加的锁、要么把第一次的会话冲掉了"
+            )
+            assert r1 == r2, f"两个并发 connect 的 profile 不一致：{r1!r} != {r2!r}"
+            assert r1.connected is True, f"profile 说没连上：{r1!r}"
+            res = rt.adapter.resolution()
+            assert res.status is A.ResolutionStatus.KNOWN and (res.width, res.height) == (
+                1920,
+                1080,
+            ), (
+                f"并发之后分辨率丢了：{res!r} —— 说明有一次 `_reset_session` 冲掉了前一次的会话"
+            )
+            assert rt.state is M.EngineState.READY, f"并发结束后应是 READY，实际 {rt.state}"
+
+            # ② 边界：三路并发（排队深度更大）仍然只发 1 次，且三个结果一致
+            with _tmpdir() as tmp2:
+                env2 = _env(tmp2)
+                rt2, fake2 = await _rt_loaded(env2)
+                try:
+                    tasks = [
+                        asyncio.ensure_future(rt2.connect(address="127.0.0.1:5555"))
+                        for _ in range(3)
+                    ]
+                    await _rt_pending(rt2, 1, what="三路并发里仍只有 1 个真正发号")
+                    _rt_event(rt2, {"what": "Connected", "details": {}, "uuid": "emu-9"})
+                    _rt_event(
+                        rt2,
+                        {
+                            "what": "ResolutionGot",
+                            "details": {"details": {"width": 1280, "height": 720}},
+                        },
+                    )
+                    _rt_event(
+                        rt2,
+                        {
+                            "what": "AsyncCallInfo",
+                            "async_call_id": fake2.connect_returns,
+                            "details": {"ret": True, "cost": 3},
+                        },
+                    )
+                    profiles = await asyncio.wait_for(asyncio.gather(*tasks), 5.0)
+                    assert fake2.calls_of("AsstAsyncConnect") == 1, (
+                        f"三路并发发了 {fake2.calls_of('AsstAsyncConnect')} 次 AsstAsyncConnect（期望 1 次）"
+                    )
+                    assert len({p.call_id for p in profiles}) == 1, (
+                        f"三路并发拿到了不同的 call_id（会话被冲掉了）：{[p.call_id for p in profiles]}"
+                    )
+                    res2 = rt2.adapter.resolution()
+                    assert (res2.width, res2.height) == (1280, 720), (
+                        f"三路并发后分辨率丢了：{res2!r}"
+                    )
+                finally:
+                    await rt2.destroy()
+        finally:
+            await rt.destroy()
+
+
+@case("W35", "runtime", "instance-options")
+async def test_w35_instance_options_applied_before_connect():
+    """W35 · 三项实例选项必须在 **Connect 之前**设好，且值就是官方 GUI 那三项。
+
+    为什么顺序是硬契约：`TouchMode` 是连接/截图时才被 controller 读走的（`AsstProxy.cs`
+    的顺序是 Create → SetInstanceOption → Connect）。连完再设 ⇒ 这一会话白设，
+    表现是"截图慢/触摸怪"这种没人能归因的症状。
+
+    三段：
+      ① 正常：`bootstrap()` 后 `AsstSetInstanceOption` 恰好 3 次，键值集合 ==
+         {(TOUCH_MODE,'minitouch'), (ADB_LITE_ENABLED,'1'), (DEPLOYMENT_WITH_PAUSE,'0')}；
+      ② 顺序：3 次 `AsstSetInstanceOption` 的下标都 **小于** `AsstAsyncConnect` 的下标；
+      ③ 错误输入：C 侧全部返回 0（老版本库/不认这几个 key）→ **不阻断装载**，
+         状态仍是 LOADED、`rejected` 如实记三项（体验项不是装载前提）。
+    """
+    M = _runtime_mod()
+    W = _wrapper_mod()
+    K = W.AsstInstanceOptionKey
+    expected = {
+        (int(K.TOUCH_MODE), "minitouch"),
+        (int(K.ADB_LITE_ENABLED), "1"),
+        (int(K.DEPLOYMENT_WITH_PAUSE), "0"),
+    }
+    with _tmpdir() as tmp:
+        env = _env(tmp)
+        rt, fake = await _rt_loaded(env)
+        try:
+            # ① 值集合
+            assert len(fake.instance_options) == 3, (
+                f"建实例后应设 3 项实例选项，实际 {fake.instance_options!r} —— "
+                "一项都不设等于把触摸/截图开关全交给 MaaCore 内部默认值"
+            )
+            assert set(fake.instance_options) == expected, (
+                f"实例选项的键值不对：{sorted(fake.instance_options)}（期望 {sorted(expected)}）。"
+                "key 写错一位 = 静默改错开关（C 侧只返回 0，不告诉你哪个 key 不合法）"
+            )
+            assert all(isinstance(v, str) for _k, v in fake.instance_options), (
+                "value 被转成了非字符串 —— C 侧自己 parse 字符串，传 bool 会静默失效"
+            )
+
+            # ② 顺序：必须在 Connect 之前
+            await _rt_connect(rt, fake)
+            log = fake.call_log
+            idx_options = [i for i, name in enumerate(log) if name == "AsstSetInstanceOption"]
+            assert len(idx_options) == 3, f"call_log 里的实例选项调用数不对：{idx_options}"
+            i_connect = log.index("AsstAsyncConnect")
+            assert max(idx_options) < i_connect, (
+                f"实例选项在 Connect 之后才设：options@{idx_options} / connect@{i_connect}。"
+                "TouchMode 是连接/截图时被读走的，连完再设等于这一会话白设"
+            )
+
+            # ③ 错误输入：C 侧全拒 → 只降级，不许把装载判死
+            with _tmpdir() as tmp2:
+                env2 = _env(tmp2)
+                rt2, fake2 = await _rt_loaded(
+                    env2, fake=F.FakeMaaCore(instance_option_returns=0)
+                )
+                try:
+                    assert rt2.state is M.EngineState.LOADED, (
+                        f"实例选项设不上竟然把装载判死了（state={rt2.state}）—— "
+                        "这些是体验调节项，不是'能不能跑'的前提"
+                    )
+                    opts = rt2.status_snapshot()["instance_options"]
+                    assert opts["applied"] == {}, f"全部返回 0 却记录了 applied：{opts!r}"
+                    assert set(opts["rejected"]) == {
+                        "TouchMode",
+                        "AdbLiteEnabled",
+                        "DeploymentWithPause",
+                    }, f"rejected 应如实记下三项，实际 {opts['rejected']!r}"
+                finally:
+                    await rt2.destroy()
+
+            # ④ 边界：只拒一项（部分成功）→ 分档必须逐项准确，不许"一荣俱荣/一损俱损"
+            with _tmpdir() as tmp3:
+                env3 = _env(tmp3)
+                fake4 = F.FakeMaaCore()
+
+                def _selective(_handle, key, _value):
+                    # 只让 TouchMode 这一项"设不上"（部分降级是真实场景：老库认不全这几个 key）
+                    return 0 if int(key) == int(K.TOUCH_MODE) else 1
+
+                fake4.f("AsstSetInstanceOption")._impl = _selective
+                # 必须在 `bootstrap()`（→ create_instance → set_instance_option）之前装好替身实现
+                rt4, _f4 = await _rt_loaded(env3, fake=fake4)
+                try:
+                    opts = rt4.status_snapshot()["instance_options"]
+                    assert set(opts["applied"]) == {"AdbLiteEnabled", "DeploymentWithPause"}, (
+                        f"部分被拒时 applied 不对：{opts['applied']!r}"
+                    )
+                    assert set(opts["rejected"]) == {"TouchMode"}, (
+                        f"部分被拒时 rejected 应只含被拒的那一项，实际 {opts['rejected']!r} —— "
+                        "全有或全无的分档会让'哪一项没设上'永远查不出来"
+                    )
+                    assert rt4.state is M.EngineState.LOADED, (
+                        f"部分被拒不该阻断装载，实际 {rt4.state}"
+                    )
+                finally:
+                    await rt4.destroy()
+        finally:
+            await rt.destroy()
+
+
+@case("W36", "runtime", "connect-extras")
+async def test_w36_connection_extras_failure_is_observable():
+    """W36 · extras **发没发出去**必须能从 `status_snapshot()` 读出来（三态可分 + 只记键名）。
+
+    为什么非测不可：``[FACT]`` C 侧 ``AsstSetConnectionExtras`` 返回 ``void``，JSON 解析失败
+    也只是**静默 return** —— 也就是说"配了 extras 却没生效"这件事，C 永远不会告诉我们。
+    上一版在 Python 侧也用 ``contextlib.suppress(Exception)`` 一起吞了，于是"用户填了 MuMu12
+    的安装目录、extras 其实根本没发出去"的表现是状态页一片正常，只能靠"截图有点慢"去猜。
+    现在三态可分，而且**"没配"与"配了但没发出去"必须是两个不同的值**（混成一个就再也
+    查不出是哪一种）。
+
+    五段：
+      ① 正常：`extras={"path": ...}` → 快照**精确等于**成功态，且连接真的成功（`READY`）；
+      ② 边界：不传 extras → 该键是 `None`（**不是** `{}`、也不是 `{"keys": [], ...}`），
+         且 `AsstSetConnectionExtras` 一次都没发；
+      ③ 错误输入：Python 侧失败 → `dispatched is False`、`error` 含异常类名、**连接仍成功**，
+         且日志是 **warning** 级（不是 error）—— 体验项降级，不是连接失败；
+      ④ 不泄露值：快照序列化后**只有键名**，不含路径 / `WindowsPath` repr；
+      ⑤ 重置语义：**真连**时重置（换 address 且不传 extras → 回 `None`），
+         **但幂等短路不重置**（会话没变，上一次"发出去了"这个事实仍然成立）。
+
+    注 ③ 的写法：**不能**用 `MissingSymbolsFake({"AsstSetConnectionExtras"})` ——
+    `wrapper.set_connection_extras` 是用 `getattr(lib, "AsstSetConnectionExtras", None)`
+    探测符号的，缺符号走的是**静默 return**（实测 `dispatched=True`、
+    `connection_extras_calls == 1`），拿它断不出 `dispatched is False`。要制造"Python 侧
+    真的抛了"只能让替身实现显式抛（等价于库已 close / 编码失败那一类真实故障）。
+    """
+    M = _runtime_mod()
+    extras_path = "D:/Program Files/Netease/MuMuPlayer-12.0"
+    want_ok = {"keys": ["path"], "dispatched": True, "error": None}
+
+    # ① 成功态（精确相等）+ ④ 不泄露值
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        try:
+            profile = await _rt_connect(
+                rt,
+                fake,
+                address="127.0.0.1:18101",
+                config="MuMuEmulator12",
+                extras={"path": extras_path},
+            )
+            assert profile.connected is True, f"带 extras 应当连接成功：{profile!r}"
+            assert rt.state is M.EngineState.READY, (
+                f"带 extras 连接成功后应是 READY，实际 {rt.state}（last_error={rt.last_error!r}）"
+            )
+            status = rt.status_snapshot()
+            assert "connection_extras" in status, (
+                f"status_snapshot() 里没有 connection_extras 字段：{sorted(status)}"
+            )
+            snap = status["connection_extras"]
+            assert isinstance(snap, dict) and isinstance(snap.get("keys"), list), (
+                f"快照的形状不对（keys 必须是 JSON 可序列化的 list）：{snap!r} —— "
+                "snapshot 会被服务层直接交给调用方/日志，tuple 之类的形状会漏到出口"
+            )
+            assert snap == want_ok, (
+                f"成功态快照应**精确等于** {want_ok!r}，实际 {snap!r} —— "
+                "键名集合漂了、或顺手把值也塞进去了，状态页/诊断就会与事实对不上"
+            )
+
+            blob = json.dumps(snap, ensure_ascii=False)
+            for leak in ("D:/", "MuMuPlayer", "Program Files", "WindowsPath"):
+                assert leak not in blob, (
+                    f"connection_extras 泄露了 extras 的**值**（含 {leak!r}）：{blob}。"
+                    "只允许记键名 —— 这个字段会被贴进状态页和 issue"
+                )
+            assert '"path"' in blob, (
+                f"快照里连键名都没有：{blob} —— 那就无法回答'哪一项 extras 没发出去'"
+            )
+            # 反证 ④ 不是空断言：值确实**发给了 C**，所以"没泄露"才有意义
+            assert len(fake.connection_extras) == 1, (
+                f"AsstSetConnectionExtras 应恰好被调用 1 次，实际 {fake.connection_extras!r}"
+            )
+            assert extras_path in fake.connection_extras[0][1], (
+                f"发给 C 的 JSON 里没有那个路径值（④ 的反证失效）：{fake.connection_extras[0]!r}"
+            )
+        finally:
+            await rt.destroy()
+
+    # ② 边界：没配 extras → None（不是 {}，也不是 {"keys": [], ...}）
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        try:
+            await _rt_connect(rt, fake, address="127.0.0.1:18102")
+            status = rt.status_snapshot()
+            assert "connection_extras" in status, (
+                f"status_snapshot() 里没有 connection_extras 字段：{sorted(status)}"
+            )
+            assert status["connection_extras"] is None, (
+                f"没配 extras 时该字段必须是 `None`，实际 {status['connection_extras']!r} —— "
+                "`{}` 或 `{'keys': [], 'dispatched': False}` 会把'用户没配'与"
+                "'配了但没发出去'折成同一个值，那这条诊断就废了"
+            )
+            assert fake.connection_extras == [], (
+                f"没配 extras 却下发了：{fake.connection_extras!r}"
+            )
+        finally:
+            await rt.destroy()
+
+    # ⑤ 重置语义：真连要重置，幂等短路不重置
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        try:
+            with_extras = {"path": extras_path}
+            await _rt_connect(
+                rt,
+                fake,
+                address="127.0.0.1:18103",
+                config="MuMuEmulator12",
+                extras=with_extras,
+            )
+            first = rt.status_snapshot()["connection_extras"]
+            assert first == want_ok, f"前置失败：带 extras 真连后快照不对：{first!r}"
+            calls = fake.calls_of("AsstAsyncConnect")
+
+            # 边界：同参**幂等短路** → 会话没变，上一次的事实仍然成立（不许被清成 None）
+            await rt.connect(
+                address="127.0.0.1:18103", config="MuMuEmulator12", extras=with_extras
+            )
+            assert fake.calls_of("AsstAsyncConnect") == calls, (
+                f"前置失败：同参连接没有走幂等短路（AsstAsyncConnect 计数 {calls}→"
+                f"{fake.calls_of('AsstAsyncConnect')}），这一段就测不到'短路不重置'"
+            )
+            kept = rt.status_snapshot()["connection_extras"]
+            assert kept == first, (
+                f"幂等短路把 extras 快照清掉了：{kept!r}（期望保持 {first!r}）。"
+                "会话没变、'上一次已发出'这个事实仍然成立；清成 None 等于谎报'这次没配'"
+            )
+
+            # 真连 + 没传 extras → 必须回 None
+            await _rt_connect(rt, fake, address="127.0.0.1:18104")
+            after = rt.status_snapshot()["connection_extras"]
+            assert after is None, (
+                f"真连且没传 extras，快照却还留着上一次的值：{after!r}。"
+                "那等于告诉用户'这次也发出去了'，而这次根本没有"
+            )
+        finally:
+            await rt.destroy()
+
+    # ③ 错误输入：Python 侧抛错 → 降级可观测，连接不受影响
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        try:
+            def _boom(_name, _value):
+                raise RuntimeError("AsstSetConnectionExtras exploded")
+
+            # 必须在 connect 之前装好替身实现（wrapper 每次调用都现取 `_impl`）
+            fake.f("AsstSetConnectionExtras")._impl = _boom
+            with _grab_logs("maa.runtime") as records:
+                profile = await _rt_connect(
+                    rt,
+                    fake,
+                    address="127.0.0.1:18105",
+                    config="MuMuEmulator12",
+                    extras={"path": extras_path},
+                )
+            assert profile.connected is True, (
+                f"extras 下发失败把连接判死了：{profile!r} —— 它只是体验项，"
+                "C 侧对坏 JSON 也只是静默 return"
+            )
+            assert rt.state is M.EngineState.READY, (
+                f"extras 失败后连接仍应成功到 READY，实际 {rt.state}"
+            )
+
+            snap = rt.status_snapshot()["connection_extras"]
+            assert isinstance(snap, dict), f"失败态快照应是 dict，实际 {snap!r}"
+            assert snap["dispatched"] is False, (
+                f"Python 侧抛了错，dispatched 却是 {snap['dispatched']!r} —— "
+                "'发出去了'这个谎正是本用例要挡的"
+            )
+            assert snap["keys"] == ["path"], (
+                f"失败态也必须记下键名（只记键名，不记值）：{snap!r}"
+            )
+            assert snap["error"], f"失败态必须带 error 文案，实际 {snap['error']!r}"
+            assert "RuntimeError" in snap["error"], (
+                f"error 里没有异常类名，排查时分不清'符号缺失'与'库没加载'：{snap['error']!r}"
+            )
+
+            texts = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+            assert any(
+                "extras" in t.lower() or "NOT dispatched" in t for t in texts
+            ), (
+                f"降级只记了 debug / 没记 warning —— 真机上没人会知道 extras 没生效：{texts!r}"
+            )
+            assert not _errors_in(records), (
+                f"体验项降级被记成了 error：{_errors_in(records)!r}。"
+                "error 会让人以为连接失败，而这次连接其实成功了"
+            )
+
+            # ④ 失败态同样不许泄露值（`error` 是唯一可能带外部文本的字段）
+            blob = json.dumps(snap, ensure_ascii=False)
+            for leak in ("D:/", "MuMuPlayer", "Program Files", "WindowsPath"):
+                assert leak not in blob, f"失败态的 error 文案泄露了 extras 的值：{blob}"
+        finally:
+            await rt.destroy()
+
+
 @case("A01", "adapter", "events")
 def test_a01_callback_from_c_thread_enqueues():
     """A01 · 回调在**独立线程**里进 Python，事件必须落到主协程（且在主线程上被派发）。
@@ -1657,6 +2589,248 @@ def test_a15_non_png_magic_keeps_raw_bytes_and_never_reencodes():
     assert fake.calls_of("AsstGetImageBgr") == 0, "走进了 BGR 裸像素路径（禁上行）"
 
 
+# --------------------------------------------------------------------------- #
+# D 组：断线事件（A16–A18）
+# --------------------------------------------------------------------------- #
+# 这一组回答同一个问题：`ConnectionInfo` 的三种事件（`Disconnect` / `ScreencapFailed`
+# / `Reconnecting`）到达时，**正在挂起的调用**应该怎么办？
+#   * 不该做的事：让调用方陪着 8–10 秒的 `capture_timeout` 一起干等（用户看到的是
+#     "截图卡住了"，而真正原因早就躺在事件里）；
+#   * 也不该做的事：一次 `ScreencapFailed` 就把整条链路判死、或 `Reconnecting` 时
+#     我们再补发一个 Connect 跟 MAA 自己打架。
+# 注入方式仍是 `_emit()`（C++ 线程进 Python 的唯一入口），断言只认耗时上界、异常类型、
+# `link_state`、以及 fake lib 的调用计数 —— 不读私有字段做判断。
+
+
+@case("A16", "adapter", "disconnect")
+async def test_a16_disconnect_fails_pending_capture_immediately():
+    """A16 · `Disconnect` 到达时，挂起的 `capture()` 必须**立刻**失败（不是等超时）。
+
+    真实故障：没有这条路径时，掉线后一次截图要等满 `capture_timeout`（默认 8s）才报
+    "截图卡住了"。宿主侧一次 entry 只有几秒预算 ⇒ 必然被超时打穿，而且报的原因
+    （缓冲/超时）会把排查引向完全错误的方向。
+
+    断言：
+      ① 耗时 **远小于** `capture_timeout`（这里 5s，断言 < 0.5s ⇒ 差一个数量级）；
+      ② 异常类型与"真失败"一致（`CaptureFailed`，不是新造一个 `DisconnectedDuringCapture`）
+         —— 断线的语义是"这次调用输了"，必须与 `ret=False` 走同一条分支；
+      ③ `AsstGetImage` **一次都没调**（没有画面可取）；
+      ④ 边界：挂起的是 **Connect** 时同样立刻失败（`AdbDisconnected`，且带事件里的 why）；
+      ⑤ 错误输入：`Disconnect` 不带 `why` → 用中性默认原因，**不许编造**具体原因，
+         也不许把异常抛穿到 C 线程。
+    """
+    A = _adapter_mod()
+    with _tmpdir() as tmp:
+        adapter, fake, _w = _adapter_full(tmp, capture_timeout=5.0)
+
+        async def scenario():
+            # ① 挂起的截图被 Disconnect 立刻打断
+            task = asyncio.ensure_future(adapter.capture())
+            await _until(lambda: adapter.stats().pending_calls == 1, what="capture slot 注册")
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            _emit(adapter, {"what": "Disconnect", "details": {"why": "adb gone"}})
+            kind, value = await _aoutcome(task)
+            cost = loop.time() - started
+
+            assert kind == "error", f"掉线了却还能截图：{value!r}"
+            assert type(value).__name__ == "CaptureFailed", (
+                f"断线应走与 ret=False 相同的 CaptureFailed 分支，"
+                f"实际 {type(value).__name__}: {value}"
+            )
+            assert cost < 0.5, (
+                f"挂起的 capture 耗时 {cost:.3f}s（capture_timeout=5s）：它在等超时，"
+                "没有把 Disconnect 当成'结果不会来了'"
+            )
+            assert adapter.link_state is A.LinkState.DISCONNECTED, (
+                f"Disconnect 之后 link_state 应是 DISCONNECTED，实际 {adapter.link_state}"
+            )
+            assert fake.calls_of("AsstGetImage") == 0, (
+                "已经掉线了还去 AsstGetImage 取图（拿到的是未初始化缓冲）"
+            )
+
+            # ④ 边界：挂起的是 Connect → AdbDisconnected，why 来自事件
+            connect_task = asyncio.ensure_future(
+                adapter.connect(address="127.0.0.1:5555", adb_path="adb")
+            )
+            await _until(lambda: adapter.stats().pending_calls == 1, what="connect slot 注册")
+            _emit(adapter, {"what": "Disconnect", "details": {"why": "device offline"}})
+            kind, value = await _aoutcome(asyncio.wait_for(connect_task, 2.0))
+            assert kind == "error", f"掉线后 connect 竟然成功了：{value!r}"
+            assert type(value).__name__ == "AdbDisconnected", (
+                f"挂起的 Connect 应以 AdbDisconnected 结束，实际 {type(value).__name__}: {value}"
+            )
+            assert "device offline" in str(getattr(value, "why", "")), (
+                "为什么掉线的原始原因丢了（用户只能看到一句'连不上'）："
+                f"{getattr(value, 'why', None)!r}"
+            )
+
+            # ⑤ 错误输入：不带 why 的 Disconnect
+            adapter._reset_session()          # 让链路状态从头来（等价于新会话）
+            cap = asyncio.ensure_future(adapter.capture())
+            await _until(lambda: adapter.stats().pending_calls == 1, what="capture slot 注册")
+            _emit(adapter, {"what": "Disconnect", "details": {}})   # 没有 why
+            kind, value = await _aoutcome(asyncio.wait_for(cap, 2.0))
+            assert kind == "error", "没有 why 的 Disconnect 没能让截图失败"
+            assert "disconnect" in adapter.link_reason.lower(), (
+                f"缺 why 时应给一句中性默认原因（含 disconnect），实际 {adapter.link_reason!r} —— "
+                "编造具体原因（'adb refused' 之类）比不说更贵"
+            )
+
+        await scenario()
+
+
+@case("A17", "adapter", "screencap-failed")
+async def test_a17_screencap_failed_only_fails_that_capture():
+    """A17 · `ScreencapFailed` 只让**挂起的那一次**截图失败，链路状态不许变。
+
+    真实故障：把 `ScreencapFailed` 当成断线，一次偶发截图失败就把 `link_state` 打成
+    `DISCONNECTED` ⇒ 上层把设备判死、用户被要求重连（而其实下一次截图就会成功）。
+
+    断言：
+      ① 正常：有挂起截图时 `ScreencapFailed` → `CaptureFailed`；
+      ② `link_state` 仍是 `CONNECTED`（此前收到过 `Connected`）；
+      ③ 边界：**没有**挂起调用时收到 `ScreencapFailed` → 不抛、不影响任何状态
+         （`_fail_pending_calls` 命中 0 条）；
+      ④ 错误输入（毒化检查）：随后再截一次必须能成功 —— 单次失败不许污染会话。
+    """
+    A = _adapter_mod()
+    with _tmpdir() as tmp:
+        adapter, fake, _w = _adapter_full(tmp, capture_timeout=5.0)
+
+        async def scenario():
+            adapter.bind_loop()
+            _emit(adapter, {"what": "Connected", "details": {}, "uuid": "emu-1"})
+            await _pump()
+            assert adapter.link_state is A.LinkState.CONNECTED, (
+                f"前置：收到 Connected 后应是 CONNECTED，实际 {adapter.link_state}"
+            )
+
+            # ① 挂起的截图被单次失败打断
+            task = asyncio.ensure_future(adapter.capture())
+            await _until(lambda: adapter.stats().pending_calls == 1, what="capture slot 注册")
+            _emit(
+                adapter,
+                {"what": "ScreencapFailed", "details": {"why": "adb screencap failed"}},
+            )
+            kind, value = await _aoutcome(asyncio.wait_for(task, 2.0))
+            assert kind == "error", f"单次截图失败却返回了数据：{value!r}"
+            assert type(value).__name__ == "CaptureFailed", (
+                f"应抛 CaptureFailed，实际 {type(value).__name__}: {value}"
+            )
+
+            # ② 链路不许被判死
+            assert adapter.link_state is A.LinkState.CONNECTED, (
+                f"一次截图失败把链路打成了 {adapter.link_state} —— "
+                "偶发失败会被升级成'设备掉线'，用户被要求重连"
+            )
+
+            # ③ 边界：没有挂起调用时的 ScreencapFailed
+            assert adapter.stats().pending_calls == 0
+            _emit(adapter, {"what": "ScreencapFailed", "details": {"why": "stray"}})
+            await _pump()
+            assert adapter.link_state is A.LinkState.CONNECTED, (
+                "孤立的 ScreencapFailed 改动了链路状态"
+            )
+            assert adapter.stats().pending_calls == 0, "孤立的 ScreencapFailed 留下了挂起调用"
+
+            # ④ 错误输入：下一次截图必须还能成功（会话没被毒化）
+            again = asyncio.ensure_future(adapter.capture())
+            await _until(lambda: adapter.stats().pending_calls == 1, what="第二次 capture 注册")
+            assert fake.calls_of("AsstAsyncScreencap") == 2, (
+                f"第二次截图没有真的发号（AsstAsyncScreencap={fake.calls_of('AsstAsyncScreencap')}）"
+            )
+            _emit(
+                adapter,
+                {
+                    "what": "AsyncCallInfo",
+                    "async_call_id": fake.screencap_returns,
+                    "details": {"ret": True, "cost": 3},
+                },
+            )
+            kind, value = await _aoutcome(asyncio.wait_for(again, 2.0))
+            assert kind == "value", f"第二次截图也失败了：{value!r} —— 会话被毒化了"
+            assert value.startswith(F.PNG_MAGIC), "第二次截图拿到的不是 PNG 原样字节"
+
+        await scenario()
+
+
+@case("A18", "adapter", "reconnecting")
+async def test_a18_reconnecting_never_resends_connect():
+    """A18 · `Reconnecting` ⇒ `link_state == RECONNECTING`，且**不得**重发 Connect。
+
+    `[FACT]` 这个状态的文档语义就是"MAA 正在自己重连，此时不要重发 Connect"
+    （见 `LinkState` 的表格）。我们再发一个只会和它打架：两个 Connect 抢同一个
+    handle，后一个的 `_reset_session()` 会把前一个正在等的结果清掉。
+
+    断言：
+      ① 正常：`Reconnecting` → `RECONNECTING`，`link_reason` 来自事件原文；
+      ② 不发 C 调用：`AsstAsyncConnect` 计数为 0；
+      ③ 边界：`Reconnecting` 之后 `Reconnected` → 回到 `CONNECTED` 且 reason 清空；
+      ④ 错误输入：`Reconnecting` **不许**让挂起的截图失败（MAA 自己会恢复，
+         此时误杀等于把"正在恢复"报成"这次截图输了"）→ 挂起数仍是 1。
+    """
+    A = _adapter_mod()
+    with _tmpdir() as tmp:
+        adapter, fake, _w = _adapter_full(tmp, capture_timeout=5.0)
+
+        async def scenario():
+            adapter.bind_loop()
+            _emit(adapter, {"what": "Connected", "details": {}, "uuid": "emu-1"})
+            await _pump()
+
+            # ④ 先挂一个截图，再让 MAA 进入重连
+            task = asyncio.ensure_future(adapter.capture())
+            await _until(lambda: adapter.stats().pending_calls == 1, what="capture slot 注册")
+
+            _emit(adapter, {"what": "Reconnecting", "details": {"why": "retrying adb"}})
+            await _pump()
+
+            # ① 状态
+            assert adapter.link_state is A.LinkState.RECONNECTING, (
+                f"Reconnecting 之后 link_state 应是 RECONNECTING，实际 {adapter.link_state}"
+            )
+            assert "retrying adb" in adapter.link_reason, (
+                f"link_reason 应是事件原文，实际 {adapter.link_reason!r}"
+            )
+
+            # ② 不许重发 Connect
+            assert fake.calls_of("AsstAsyncConnect") == 0, (
+                f"Reconnecting 触发了 {fake.calls_of('AsstAsyncConnect')} 次 AsstAsyncConnect —— "
+                "MAA 正在自己重连，再发一个会和它抢同一个 handle"
+            )
+
+            # ④ 挂起的截图不许被误杀
+            assert adapter.stats().pending_calls == 1, (
+                "Reconnecting 把挂起的截图判失败了 —— 那会把'正在恢复'报成'这次截图输了'"
+            )
+
+            # ③ 恢复
+            _emit(adapter, {"what": "Reconnected", "details": {}})
+            await _pump()
+            assert adapter.link_state is A.LinkState.CONNECTED, (
+                f"Reconnected 之后应回到 CONNECTED，实际 {adapter.link_state}"
+            )
+            assert adapter.link_reason == "", (
+                f"链路恢复后 link_reason 必须清空（否则状态页永远挂着上一次的原因），"
+                f"实际 {adapter.link_reason!r}"
+            )
+
+            # 收尾：把挂起的截图正常结束掉，避免给后续断言留噪声
+            _emit(
+                adapter,
+                {
+                    "what": "AsyncCallInfo",
+                    "async_call_id": fake.screencap_returns,
+                    "details": {"ret": True, "cost": 2},
+                },
+            )
+            kind, value = await _aoutcome(asyncio.wait_for(task, 2.0))
+            assert kind == "value", f"恢复后那次截图应该能拿到图，实际 {value!r}"
+            assert value.startswith(F.PNG_MAGIC)
+
+        await scenario()
+
 
 # --------------------------------------------------------------------------- #
 # R 组：runtime 状态机 / 装载 / 装配
@@ -1683,6 +2857,7 @@ import errno
 import hashlib
 import http.server
 import io
+import logging
 import os
 import re
 import types
@@ -3392,6 +4567,550 @@ async def test_r18_capture_fails_fast_while_downloading():
         finally:
             await rt.cancel_download()
             gate.set()
+            await rt.destroy()
+
+
+# --------------------------------------------------------------------------- #
+# B 组：销毁 / UAF（R20–R23）
+# --------------------------------------------------------------------------- #
+@contextlib.contextmanager
+def _grab_logs(logger_name: str):
+    """抓某个 logger 的记录（`caplog` 的零依赖替代）。
+
+    **必须包住构造**：`unknown instance option` 那条 warning 是在 `__init__` 里打的，
+    只在 `bootstrap()` 期间挂 handler 会漏掉它（实测踩过）。
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:  # noqa: D102
+            records.append(record)
+
+    logger = logging.getLogger(logger_name)
+    handler = _Grab()
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
+def _errors_in(records, *, level: int = logging.ERROR) -> list[str]:
+    return [r.getMessage() for r in records if r.levelno >= level]
+
+
+async def _fresh_loaded(tmp: Path, fake=None, **over):
+    """新的 tmp + 新的 runtime，直接到 `LOADED`（销毁类用例每个 block 各来一套）。"""
+    env = _env(tmp)
+    return await _rt_loaded(env, fake, **over)
+
+
+@case("R20", "runtime", "destroy")
+async def test_r20_destroy_stops_before_destroy_and_abandons_on_timeout():
+    """R20 · `Stop → Destroy` 同线程顺序执行；超时**放弃**时 detach 且**绝不 close**。
+
+    三条 C 侧事实决定了这条用例的形状（见 `destroy()` 的 docstring）：
+    ``AsstStop`` 清任务队列（让 ``~Assistant`` 只等当前这一条），``AsstDestroy`` 会 join
+    三条内部线程且**可能无限阻塞**，而 ``Destroyed`` 回调是析构的**最后一句** ——
+    也就是说"放弃等待"那一刻，C 线程**仍可能**回调进已经拆光的 Python 状态。
+
+    断言：
+      ① 顺序：`call_log` 里 `AsstStop` **先于** `AsstDestroy`（分两个线程并发调同一个
+         handle = 对同一个 C++ 对象 UAF，比"慢一点"严重得多）；
+      ② 正常路径（对照组）：确认已销毁 → `wrapper.close()`（`_lib` 置空）、
+         `detach_calls == 0`、`destroy_abandoned == 0`；
+      ③ 超时放弃：① **error 级**日志且文本含 "abandon"（这是"已知会崩的窗口"，
+         不是普通告警）② `detach_callback()` 被调用（`callback_attached is False`）
+         ③ **不 close**（`_lib` 仍活着：C 线程可能还在懒加载依赖）
+         ④ `lifecycle_stats['destroy_abandoned'] == 1` 且 wrapper 被保活；
+      ④ 错误输入：`AsstStop` 抛错 → **不许**阻止 `AsstDestroy`（销毁优先），
+         也不许因此记成"放弃"（那时实例其实已经删掉了）。
+    """
+    M = _runtime_mod()
+
+    # ② 正常路径（对照组）：确认销毁 → 允许 close
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        w = rt._wrapper
+        assert w is not None, "前置失败：bootstrap 后应持有 wrapper"
+        assert w.callback_attached is True, (
+            "前置失败：runtime 装载时应 set_callback（否则收不到任何事件）"
+        )
+        with _grab_logs("maa.runtime") as records:
+            await rt.destroy()
+        log = fake.call_log
+        i_stop, i_destroy = fake.index_of("AsstStop"), fake.index_of("AsstDestroy")
+        assert i_stop >= 0 and i_destroy >= 0, (
+            f"销毁路径少调了符号：call_log={log}（AsstStop 必须真的被调用）"
+        )
+        assert i_stop < i_destroy, (
+            f"顺序反了：AsstStop@{i_stop} 必须在 AsstDestroy@{i_destroy} 之前 —— "
+            "Stop 先清队列，~Assistant 的 join 才只等当前这一条任务"
+        )
+        assert w._lib is None, (
+            "确认已销毁之后必须 close()（释放 CDLL 与 add_dll_directory 句柄）"
+        )
+        assert w.detach_calls == 0, (
+            f"正常路径不该走 detach_callback（那是放弃路径的补救），实际 {w.detach_calls} 次"
+        )
+        stats = rt.lifecycle_stats
+        assert (stats["stop_calls"], stats["destroy_calls"]) == (1, 1), (
+            f"一次销毁应各发 1 次 C 调用，实际 {stats}"
+        )
+        assert stats["destroy_abandoned"] == 0, f"正常路径不该记放弃：{stats}"
+        assert not _errors_in(records), f"正常销毁打出了 error 日志：{_errors_in(records)!r}"
+
+    # ③ 超时放弃：error 日志 + detach + 不 close + 计数
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(
+            tmp, fake=F.FakeMaaCore(destroy_delay=0.5), destroy_timeout=0.05
+        )
+        w = rt._wrapper
+        with _grab_logs("maa.runtime") as records:
+            await rt.destroy()
+        log = fake.call_log
+        i_stop, i_destroy = fake.index_of("AsstStop"), fake.index_of("AsstDestroy")
+        assert i_stop >= 0 and i_destroy >= 0 and i_stop < i_destroy, (
+            f"放弃路径也必须先 Stop 再 Destroy（同一线程顺序执行）：call_log={log}"
+        )
+
+        errors = _errors_in(records)
+        assert errors, (
+            "放弃销毁只打了 debug/没打日志 —— 这是'已知会崩的窗口'，"
+            "必须是 error 级（否则真机上永远没人知道后台线程还活着）"
+        )
+        assert any("abandon" in text.lower() for text in errors), (
+            f"error 日志里没有 'abandon' 字样，无法被日志告警规则抓到：{errors!r}"
+        )
+
+        assert w.detach_calls == 1, (
+            f"放弃时必须调一次 detach_callback（把 Python 目标摘成空，挡逻辑 UAF），"
+            f"实际 {w.detach_calls} 次"
+        )
+        assert w.callback_attached is False, (
+            "detach 之后 callback_attached 必须是 False（否则 C 线程还会打到已拆的状态）"
+        )
+        assert w._lib is not None, (
+            "放弃时**调用了 wrapper.close()** —— 库句柄被解引用，而 C 线程可能还在懒加载依赖。"
+            "放弃路径必须保活那一份 wrapper（有界泄漏是设计）"
+        )
+
+        stats = rt.lifecycle_stats
+        assert stats["destroy_abandoned"] == 1, (
+            f"destroy_abandoned 应为 1，实际 {stats['destroy_abandoned']}（{stats}）"
+        )
+        assert stats["abandoned_wrappers"] == 1, (
+            f"被保活的 wrapper 数应与放弃次数一致，实际 {stats}"
+        )
+        assert stats["detach_invocations"] == 1, (
+            f"detach_invocations 应为 1，实际 {stats['detach_invocations']}"
+        )
+        assert rt.state is M.EngineState.ABSENT, (
+            f"放弃等待也要把 Python 侧状态收干净（ABSENT），实际 {rt.state}"
+        )
+
+    # ④ 错误输入：AsstStop 抛错不许阻止 AsstDestroy
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        w = rt._wrapper
+
+        def _boom(_handle):
+            raise RuntimeError("AsstStop exploded")
+
+        fake.f("AsstStop")._impl = _boom
+        with _grab_logs("maa.runtime") as records:
+            await rt.destroy()
+        assert "AsstDestroy" in fake.call_log, (
+            f"AsstStop 抛错后不再调 AsstDestroy —— 等于把实例留给进程退出：{fake.call_log}"
+        )
+        stats = rt.lifecycle_stats
+        assert stats["destroy_abandoned"] == 0, (
+            f"Stop 失败不该记成'放弃'（AsstDestroy 成功了、实例真的删掉了）：{stats}"
+        )
+        assert w._lib is None, "确认销毁后仍应 close()"
+        assert not _errors_in(records), (
+            f"Stop 失败只是降级（debug），不许打 error：{_errors_in(records)!r}"
+        )
+
+
+@case("R21", "runtime", "destroy")
+async def test_r21_destroy_thread_failure_is_treated_as_abandoned():
+    """R21 · 销毁线程抛错 = 实例状态未知 ⇒ 与超时同性质：error 日志 + detach + 计数。
+
+    `[FACT]` `destroy_instance` 唯一的抛错点是 `_require_lib()`（库已被 close）——
+    也就是 **`AsstDestroy` 根本没发出去**。旧实现只记 debug，等于把"实例没被销毁"
+    静默吞掉；真机上表现成"关不掉的后台线程 / 退出时卡住"。
+
+    三段：
+      ① 正常（本例的"正常"就是那条失败路径）：先 `close()` 再 `destroy()` →
+         error 日志含 "abandon"、`detach_callback` 被调用、`destroy_abandoned == 1`、
+         `destroy()` **不抛**（它是 `on_shutdown` 钩子，抛错会被宿主判 shutdown 失败）；
+      ② 边界：替身 wrapper **没有** `detach_callback`（可选能力探测）→ 关机路径仍不许抛；
+      ③ 错误输入：放弃之后再 `destroy()` → 不抛、`destroy_calls` 不再增长（幂等）。
+    """
+    M = _runtime_mod()
+
+    # ① 销毁线程抛错（真实成因：库已被 close）
+    with _tmpdir() as tmp:
+        rt, _fake = await _fresh_loaded(tmp)
+        w = rt._wrapper
+        detach_seen: list[int] = []
+        real_detach = w.detach_callback
+
+        def _spy() -> bool:
+            detach_seen.append(1)
+            return real_detach()
+
+        w.detach_callback = _spy
+        w.close()                                  # → 之后的 AsstStop/AsstDestroy 必然失败
+
+        with _grab_logs("maa.runtime") as records:
+            await rt.destroy()                     # 不许抛：这是 on_shutdown 钩子
+        errors = _errors_in(records)
+        assert errors, "销毁线程抛错却没打 error 日志（旧实现只记 debug，等于静默吞掉）"
+        assert any("abandon" in text.lower() for text in errors), (
+            f"error 日志里没有 'abandon' 字样：{errors!r}"
+        )
+        assert len(detach_seen) == 1, (
+            f"销毁线程抛错后必须调 detach_callback（实例可能还活着），实际 {len(detach_seen)} 次"
+        )
+        stats = rt.lifecycle_stats
+        assert stats["destroy_abandoned"] == 1, (
+            f"应计入 destroy_abandoned，实际 {stats['destroy_abandoned']}（{stats}）"
+        )
+        assert stats["abandoned_wrappers"] == 1, f"wrapper 应被保活，实际 {stats}"
+        assert stats["stop_calls"] == 1 and stats["destroy_calls"] == 1, (
+            f"一次销毁各发 1 次，实际 {stats}"
+        )
+
+        # ③ 幂等：放弃之后再 destroy 不许抛、不许再加计数
+        await rt.destroy()
+        assert rt.lifecycle_stats["destroy_calls"] == 1, (
+            f"二次 destroy 又发了一次 AsstDestroy：{rt.lifecycle_stats}（double free 是 UAF）"
+        )
+        assert rt.state is M.EngineState.ABSENT
+
+    # ② 边界：替身 wrapper 没有 detach_callback（可选能力缺失）
+    with _tmpdir() as tmp:
+        rt, _fake = await _fresh_loaded(tmp)
+        w = rt._wrapper
+        w.detach_callback = None                   # 模拟"替身实现没这个方法"
+        w.close()
+        with _grab_logs("maa.runtime") as records:
+            kind, value = await _aoutcome(rt.destroy())
+        assert kind == "value", (
+            f"wrapper 没有 detach_callback 时关机路径抛了 {value!r} —— "
+            "可选能力必须用 getattr 探测，绝不因为替身少个方法就让关机失败"
+        )
+        assert _errors_in(records), "仍然应该是 error 级（实例状态未知这件事没变）"
+        assert rt.lifecycle_stats["destroy_abandoned"] == 1, (
+            f"没有 detach 能力不代表不算放弃：{rt.lifecycle_stats}"
+        )
+
+
+@case("R22", "runtime", "destroy")
+async def test_r22_destroy_is_idempotent():
+    """R22 · `destroy()` 幂等：重复调用 / `ABSENT` 状态调用 → 各计数**仍为 1**（不是 2）。
+
+    为什么这条是安全项而不是洁癖：`AsstDestroy` 是 ``delete handle``，**delete 两次是
+    UAF**，不是"多删一个空指针"。宿主可能同时从 `on_shutdown` 与错误路径各调一次。
+
+    三段：
+      ① 正常：`bootstrap()` → `destroy()` → (1,1)；再 `destroy()` → 仍是 (1,1)；
+      ② 边界：第三次（此时 state 已是 `ABSENT`）→ 仍是 (1,1)、不抛；
+      ③ 错误输入（"不是一次性对象"）：再次 `bootstrap()`（布局还在）→ 新实例 →
+         `destroy()` → 变成 (2,2)。计数器口径是"**每个实例**一次销毁"，不是"进程一次"。
+    """
+    M = _runtime_mod()
+    with _tmpdir() as tmp:
+        rt, _fake = await _fresh_loaded(tmp)
+        try:
+            await rt.destroy()
+            stats = rt.lifecycle_stats
+            assert (stats["stop_calls"], stats["destroy_calls"]) == (1, 1), (
+                f"一次销毁应各 1 次，实际 {stats}"
+            )
+            assert rt.state is M.EngineState.ABSENT, f"销毁后状态应是 ABSENT，实际 {rt.state}"
+
+            await rt.destroy()
+            again = rt.lifecycle_stats
+            assert (again["stop_calls"], again["destroy_calls"]) == (1, 1), (
+                "重复 destroy 又发了 C 调用："
+                f"{again}（AsstDestroy 调两次 = double free = UAF，比'多删个空指针'严重）"
+            )
+
+            # ② ABSENT 状态下再调一次
+            kind, value = await _aoutcome(rt.destroy())
+            assert kind == "value", f"ABSENT 状态 destroy 抛了 {value!r}（退出路径不许抛）"
+            third = rt.lifecycle_stats
+            assert (third["stop_calls"], third["destroy_calls"]) == (1, 1), (
+                f"ABSENT 状态 destroy 改了计数：{third}"
+            )
+
+            # ③ 重新装载 → 新实例 → 必须能再销毁（不是一次性对象）
+            state = await rt.bootstrap()
+            assert state is M.EngineState.LOADED, (
+                f"销毁后再 bootstrap 应能重新装载（布局还在），实际 {state}"
+            )
+            await rt.destroy()
+            fresh = rt.lifecycle_stats
+            assert (fresh["stop_calls"], fresh["destroy_calls"]) == (2, 2), (
+                "第二个实例的销毁没被计数（或第一个实例被重复销毁）："
+                f"{fresh}（每个实例各一次才对）"
+            )
+        finally:
+            await rt.destroy()
+
+
+@case("R23", "runtime", "destroy")
+async def test_r23_concurrent_destroy_sends_one_delete():
+    """R23 · 并发 `destroy()`：只发**一次** delete，后来的直接返回（不排队、不抛）。
+
+    宿主可能从两条路径同时关停（`on_shutdown` + 失败清理）。没有 `_teardown_in_progress`
+    这道闸时，两个协程各发一次 `AsstDestroy` —— `delete` 两次就是 UAF。
+
+    三段：
+      ① 正常：`destroy()` 跑到一半（用 `destroy_delay` + 大超时固定住窗口）→
+         第二次 `destroy()` **立刻返回**，`destroy_calls` 仍 1；
+      ② 边界：三路 `gather` → 仍是 1；
+      ③ 错误输入：销毁进行中再连打 3 次 → 都不抛、计数都不变。
+    """
+    # ① 第二次立刻返回
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(
+            tmp, fake=F.FakeMaaCore(destroy_delay=0.5), destroy_timeout=3.0
+        )
+        first = asyncio.ensure_future(rt.destroy())
+        await asyncio.sleep(0)                    # 让第一个跑到挂起点（wait_for）
+        assert rt.lifecycle_stats["teardown_in_progress"] == 1, (
+            "destroy() 没有把 teardown_in_progress 立起来（并发闸失效）"
+        )
+        assert rt.lifecycle_stats["destroy_calls"] == 1
+
+        second = asyncio.ensure_future(rt.destroy())
+        await asyncio.sleep(0)
+        assert second.done(), (
+            "第二次 destroy() 在排队等待 —— 那会拖住 on_shutdown（且窗口内状态已不可信）"
+        )
+        assert rt.lifecycle_stats["destroy_calls"] == 1, (
+            f"并发第二次 destroy 又发了 AsstDestroy：{rt.lifecycle_stats}"
+        )
+
+        results = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 5.0)
+        assert results == [None, None], f"并发 destroy 抛了：{results!r}"
+        stats = rt.lifecycle_stats
+        assert (stats["stop_calls"], stats["destroy_calls"]) == (1, 1), (
+            f"并发销毁后应各 1 次，实际 {stats}"
+        )
+        assert stats["teardown_in_progress"] == 0, "销毁结束后标志没落下"
+        assert stats["destroy_abandoned"] == 0, f"这不是放弃路径：{stats}"
+
+    # ② 边界：三路并发
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(
+            tmp, fake=F.FakeMaaCore(destroy_delay=0.5), destroy_timeout=3.0
+        )
+        results = await asyncio.wait_for(
+            asyncio.gather(rt.destroy(), rt.destroy(), rt.destroy(), return_exceptions=True),
+            5.0,
+        )
+        assert all(r is None for r in results), f"三路并发 destroy 有异常：{results!r}"
+        stats = rt.lifecycle_stats
+        assert (stats["stop_calls"], stats["destroy_calls"]) == (1, 1), (
+            f"三路并发销毁应各 1 次，实际 {stats}"
+        )
+
+        # ③ 错误输入：销毁之后再连打（此时是 ABSENT）
+        for _ in range(3):
+            kind, value = await _aoutcome(rt.destroy())
+            assert kind == "value", f"销毁后 destroy 抛了 {value!r}"
+        assert (rt.lifecycle_stats["stop_calls"], rt.lifecycle_stats["destroy_calls"]) == (1, 1)
+
+
+@case("R24", "runtime", "health")
+async def test_r24_health_converges_after_disconnect():
+    """R24 · 断线后 `health()` **惰性收敛**：不允许继续报 `READY`。
+
+    不改会怎样：断线后 `_state` 仍是 `READY`，`health()` / `status` 继续显示"一切就绪"；
+    用户照着一个"就绪"的状态点截图，然后等满 `capture_timeout` 才拿到"截图卡住了"——
+    而真正原因（掉线）早就躺在 `adapter.link_state` 里。
+
+    三段：
+      ① 正常：`READY` + 注入 `Disconnect` → `health()` 之后 `_state` 变 `LOADED`、
+         `status_snapshot()['link_state'] == 'disconnected'`、`_last_error` 是
+         `AdbDisconnected` 且 why 来自事件、`connected is False`、`device` 被清空；
+      ② 边界：再读一次 `health()` → 不许重复构造新的 `AdbDisconnected`
+         （`last_error` 应是同一个对象：状态已收敛，没有新的"事实"）；
+      ③ 错误输入：还没连过（`LOADED`）时收到 `Disconnect` → **不许伪造** `AdbDisconnected`
+         （那时根本没有会话可掉线）。
+    """
+    A = _adapter_mod()
+    M = _runtime_mod()
+    E = _errors_mod()
+
+    with _tmpdir() as tmp:
+        rt, fake = await _fresh_loaded(tmp)
+        try:
+            await _rt_connect(rt, fake)
+            assert rt.state is M.EngineState.READY, f"前置失败：{rt.state}"
+            assert rt.status_snapshot()["link_state"] == "connected", (
+                f"前置失败：连上后 link_state 应是 connected，"
+                f"实际 {rt.status_snapshot()['link_state']!r}"
+            )
+
+            _rt_event(rt, {"what": "Disconnect", "details": {"why": "adb gone"}})
+            await _until(
+                lambda: rt.adapter.link_state is A.LinkState.DISCONNECTED,
+                what="adapter 已把链路标成 DISCONNECTED",
+            )
+            assert rt.state is M.EngineState.READY, (
+                "前置：收敛是**惰性**的（读快照时才下沉），这里还没读"
+            )
+
+            snapshot = rt.health()
+            assert snapshot.state is M.EngineState.LOADED, (
+                f"断线后 health() 仍报 {snapshot.state} —— 状态页会说'一切就绪'，"
+                "用户照着它去点截图，然后等满 capture_timeout"
+            )
+            assert rt.state is M.EngineState.LOADED, f"health() 没把 _state 收下去：{rt.state}"
+            assert rt.status_snapshot()["link_state"] == "disconnected", (
+                f"status 里的 link_state 应是 disconnected，"
+                f"实际 {rt.status_snapshot()['link_state']!r}"
+            )
+            error = rt.last_error
+            assert isinstance(error, E.AdbDisconnected), (
+                f"_last_error 应是 AdbDisconnected，实际 {type(error).__name__}: {error}"
+            )
+            assert "adb gone" in str(getattr(error, "why", "")), (
+                f"why 应是事件原文（不编造），实际 {getattr(error, 'why', None)!r}"
+            )
+            assert snapshot.connected is False, (
+                "已经掉线了 health().connected 还是 True —— 用户会以为'现在能用'"
+            )
+            assert snapshot.device is None, (
+                f"掉线后 device 缓存必须被丢掉（否则显示 connected=True 的旧快照）："
+                f"{snapshot.device!r}"
+            )
+
+            # ② 边界：重复读快照不许重复构造异常
+            first_error = rt.last_error
+            rt.health()
+            assert rt.last_error is first_error, (
+                "第二次 health() 又造了一个新的 AdbDisconnected —— "
+                "收敛应当幂等（状态已经 LOADED，没有新的'事实'）"
+            )
+            assert rt.state is M.EngineState.LOADED
+        finally:
+            await rt.destroy()
+
+    # ③ 错误输入：从没连过时收到 Disconnect → 不许伪造掉线错误
+    with _tmpdir() as tmp:
+        rt, _fake = await _fresh_loaded(tmp)
+        try:
+            assert rt.last_error is None, f"前置失败：刚装载就有错误 {rt.last_error!r}"
+            _rt_event(rt, {"what": "Disconnect", "details": {"why": "stray"}})
+            rt.health()
+            assert rt.last_error is None, (
+                "还没连接过就报了 AdbDisconnected —— 没有会话可掉线，这是伪造事实"
+                f"（last_error={rt.last_error!r}）"
+            )
+            assert rt.state is M.EngineState.LOADED, (
+                f"没有会话时不该动状态，实际 {rt.state}"
+            )
+        finally:
+            await rt.destroy()
+
+
+@case("R25", "runtime", "diagnostics")
+async def test_r25_status_snapshot_declares_client_scope_and_instance_options():
+    """R25 · `status_snapshot()` 必须声明客户端范围，并如实分档实例选项。
+
+    `[FACT]` MaaCore **没有任何 C API 能查"当前连的是哪个客户端"**（客户端类型是识别
+    阶段模板匹配出来的内部状态）。所以"只支持国服官服"只能是**声明** —— 而声明如果不
+    出现在诊断字段里，外服用户报障时就会去反复重启/重下引擎/换端口，全都无效。
+
+    三段：
+      ① 正常：`client_scope == "cn-official"`；`instance_options` 恰好三个键
+         requested / applied / rejected，且 applied 含官方 GUI 那三项；
+      ② 边界：只覆盖一项 → 其余**保持默认**（"部分设置"比"完全不设置"更难排查，
+         所以 requested 必须是"默认值 + 覆盖"的合并结果，不是"只留覆盖项"）；
+      ③ 错误输入：未知选项名 → 忽略 + 一条 warning（不许抛、不许进 requested），
+         装载照常到 LOADED。
+    """
+    M = _runtime_mod()
+    W = _wrapper_mod()
+    K = W.AsstInstanceOptionKey
+    names = {"TouchMode", "AdbLiteEnabled", "DeploymentWithPause"}
+
+    with _tmpdir() as tmp:
+        rt, _fake = await _fresh_loaded(tmp)
+        try:
+            snapshot = rt.status_snapshot()
+            assert snapshot["client_scope"] == "cn-official", (
+                f"client_scope 声明不对：{snapshot['client_scope']!r}（期望 'cn-official'）—— "
+                "外服用户报障时这是唯一的'我们本来就不支持'证据"
+            )
+            options = snapshot["instance_options"]
+            assert set(options) == {"requested", "applied", "rejected"}, (
+                f"instance_options 必须恰好有三个分档，实际 {sorted(options)}"
+            )
+            assert set(options["applied"]) == names, (
+                f"applied 应是官方 GUI 那三项，实际 {sorted(options['applied'])}"
+            )
+            assert options["rejected"] == {}, f"全部成功时 rejected 应为空：{options}"
+            assert set(options["requested"]) == names, (
+                f"requested 应含三项，实际 {sorted(options['requested'])}"
+            )
+
+            # ② 边界：只覆盖一项，其余保持默认
+            with _tmpdir() as tmp2:
+                rt2, fake2 = await _fresh_loaded(
+                    tmp2, instance_options={"TouchMode": "maatouch"}
+                )
+                try:
+                    requested = rt2.status_snapshot()["instance_options"]["requested"]
+                    assert requested == {
+                        "TouchMode": "maatouch",
+                        "AdbLiteEnabled": "1",
+                        "DeploymentWithPause": "0",
+                    }, (
+                        f"覆盖一项后 requested 应是'默认值+覆盖'的合并结果，实际 {requested!r} —— "
+                        "只留覆盖项等于把其它开关交回 MaaCore 内部默认，比完全不设更难排查"
+                    )
+                    assert (int(K.TOUCH_MODE), "maatouch") in fake2.instance_options, (
+                        f"覆盖值没有真的传到 C：{fake2.instance_options!r}"
+                    )
+                finally:
+                    await rt2.destroy()
+
+            # ③ 错误输入：未知选项名
+            with _tmpdir() as tmp3:
+                with _grab_logs("maa.runtime") as records:
+                    rt3, _fake3 = await _fresh_loaded(
+                        tmp3, instance_options={"TouchMode": "adb", "NOPE": "1"}
+                    )
+                try:
+                    assert rt3.status_snapshot()["state"] == M.EngineState.LOADED.value, (
+                        "一个不认识的选项名把装载搞挂了 —— 配置是外部输入，"
+                        "手滑一个 key 不该让整个插件起不来"
+                    )
+                    requested = rt3.status_snapshot()["instance_options"]["requested"]
+                    assert "NOPE" not in requested, f"未知选项被当成真的设下去了：{requested!r}"
+                    warnings = [
+                        r.getMessage()
+                        for r in records
+                        if r.levelno >= logging.WARNING and "NOPE" in r.getMessage()
+                    ]
+                    assert warnings, (
+                        "未知选项被静默丢掉 —— 至少要有一条 warning，"
+                        f"否则用户写了错 key 永远查不出来（记录={[r.getMessage() for r in records]!r}）"
+                    )
+                finally:
+                    await rt3.destroy()
+        finally:
             await rt.destroy()
 
 
