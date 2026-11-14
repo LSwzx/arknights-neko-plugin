@@ -1830,7 +1830,9 @@ def test_s16_connection_extras_are_sanitized_before_entry_data():
          消毒不许把它、也不许把它的 `error` 原因洗掉；
       ③ 路径消毒（核心）：`error` 里带 ``C:/Users/me/MaaCore.dll`` 与
          ``D:/Program Files/X/MuMuPlayer``、`keys` 里塞一个路径型键名 →
-         ``json.dumps(data)`` 里**不得**出现路径片段或 ``WindowsPath`` repr，
+         `data` 的 `keys`/`error` 扫不出**绝对路径形态**、`.dll` / `MaaCore` /
+         ``WindowsPath`` 等片段也不出现（**不从 JSON 串里扫形态**：``json.dumps``
+         会把 ``\`` 转成 ``\\``，那样断是假绿，实测过），
          但 `dispatched` 仍在、键数量不缩水、诊断词活下来；
       ④ ``None`` 保留：``connection_extras=None`` → `data` 里就是 ``None``
          （"没配"必须与"配了没发出去"可区分，既不许丢键也不许变 ``{}``）；

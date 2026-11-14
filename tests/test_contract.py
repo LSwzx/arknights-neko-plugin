@@ -2490,31 +2490,50 @@ def test_a14_stale_events_do_not_satisfy_next_task():
 
     真实故障：盲扫队列 + 谓词猜结果 —— "第二次同步"拿到第一轮的结果写进缓存，
     截图内容和任务时刻对不上，且没有任何报错。
+
+    **两轮各用一个 adapter，这不是顺手为之**：第一轮要"真超时"就必须有一个小的
+    真实预算（``capture_timeout`` 是墙钟），而第二轮的三次事件注入 + 断言必须在
+    自己的预算内跑完。同一台 adapter 上共用一个小预算时，第二轮的成败取决于
+    "第一轮结束后还剩多少毫秒"—— 一旦前序各组把机器搞得慢一点（``-X dev`` 下
+    稳定复现），第二轮会先撞上自己的 ``CaptureTimeout``，于是
+    ``assert not task.done()`` 红成噪声，而它其实与"迟到事件"毫无关系。
+    分开之后：第一轮只负责造一次超时，第二轮有 2s 预算，断言只依赖事件顺序，
+    不依赖余量 —— 负载再高也不会假红。
     """
     with _tmpdir() as tmp:
+        # 第一轮：小预算，只为造一次真超时（不发任何事件，所以必然走超时分支）
         adapter, fake, _w = _adapter_full(tmp, capture_timeout=0.05)
 
-        async def scenario():
+        async def round_one():
             adapter.bind_loop()
             kind, value = await _aoutcome(adapter.capture())
             assert kind == "error" and type(value).__name__ == "CaptureTimeout", (
                 f"第一轮应超时，实际 {type(value).__name__}: {value!r}"
             )
 
-            fake.screencap_returns = 2
-            task = asyncio.ensure_future(adapter.capture())
-            await _until(lambda: adapter.stats().pending_calls == 1, what="第二轮 slot 注册")
+        asyncio.run(round_one())
+
+        # 第二轮：独立 adapter（同一台 fake），2s 预算 —— 断言不依赖任何余量
+        fake.screencap_returns = 2
+        adapter2, _same_fake, _w2 = _adapter_full(tmp, fake=fake, capture_timeout=2.0)
+
+        async def round_two():
+            adapter2.bind_loop()
+            task = asyncio.ensure_future(adapter2.capture())
+            await _until(
+                lambda: adapter2.stats().pending_calls == 1, what="第二轮 slot 注册"
+            )
 
             # 孤儿事件：一个"成功"，一个"失败"，都带旧的 id
             _emit(
-                adapter,
+                adapter2,
                 {"what": "AsyncCallInfo", "async_call_id": 1, "details": {"ret": True, "cost": 111}},
             )
             await _pump()
             assert not task.done(), "第二轮被上一轮的迟到成功事件满足了"
 
             _emit(
-                adapter,
+                adapter2,
                 {
                     "what": "AsyncCallInfo",
                     "async_call_id": 1,
@@ -2523,18 +2542,20 @@ def test_a14_stale_events_do_not_satisfy_next_task():
             )
             await _pump()
             assert not task.done(), "第二轮被上一轮的迟到失败事件满足了"
-            assert adapter.stats().events_dropped_late == 2
+            assert adapter2.stats().events_dropped_late == 2, (
+                f"两条迟到事件都应被按 id 丢弃，实际 {adapter2.stats().events_dropped_late}"
+            )
 
             _emit(
-                adapter,
+                adapter2,
                 {"what": "AsyncCallInfo", "async_call_id": 2, "details": {"ret": True, "cost": 42}},
             )
             return await asyncio.wait_for(task, 2.0)
 
-        data = asyncio.run(scenario())
+        data = asyncio.run(round_two())
 
     assert data == fake.payload, "第二轮拿到的图像不是本次的数据"
-    assert adapter.stats().events_dropped_late == 2
+    assert adapter2.stats().events_dropped_late == 2
 
 
 @case("A15", "adapter", "format")
