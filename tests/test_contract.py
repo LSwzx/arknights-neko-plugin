@@ -17,38 +17,34 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import builtins
 import contextlib
 import ctypes
+import errno
+import hashlib
+import http.server
+import io
 import json
+import logging
+import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
+import types
+import zipfile
+from collections import Counter
 from pathlib import Path
 
-
-# --------------------------------------------------------------------------- #
-# 路径引导：脱离宿主跑，插件根要进 sys.path
-# --------------------------------------------------------------------------- #
-def _bootstrap_path() -> None:
-    """插件正常是被宿主以 `plugin.plugins.arknights_neko_plugin` 加载的。
-
-    单独跑测试时没有这个包前缀，所以把插件根与 tests 目录都塞进 `sys.path`，
-    让 `import maa.wrapper` / `import _fakelib` 成立。
-    """
-    here = Path(__file__).resolve()
-    tests_dir = str(here.parent)
-    plugin_root = str(here.parents[1])
-    for p in (plugin_root, tests_dir):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-
-
-_bootstrap_path()
-
-import _fakelib as F  # noqa: E402  （必须在上面的 bootstrap 之后）
-import _runner as R  # noqa: E402
-from _runner import Blocked, Unimplemented, case  # noqa: E402
+# 路径引导是 `_bootstrap` 的 **import 期副作用**，所以它必须排在 `_fakelib` 之前；
+# 靠"下划线开头的模块名排最前"保证顺序，而不是靠运行时先调一次函数。
+# 为什么不能写"先调 _bootstrap_path() 再 import"：CI 用
+# `ruff check --ignore-noqa --isolated`，noqa 与 ruff.toml 双双失效，E402 无法抑制。
+import _bootstrap
+import _fakelib as F
+import _runner as R
+from _runner import Blocked, case
 
 
 # --------------------------------------------------------------------------- #
@@ -498,7 +494,6 @@ def test_w16_invalid_call_id_is_rejected():
 @case("W17", "wrapper", "extras")
 def test_w17_connection_extras_failure_is_observable():
     """W17 · `set_connection_extras` 传坏 JSON 不能静默装成功（F9）。"""
-    W = _wrapper_mod()
     with _tmpdir() as tmp:
         w, fake = _loaded(tmp)
         setter = getattr(w, "set_connection_extras", None)
@@ -745,8 +740,6 @@ _WRITE_TASKS = ("Fight", "Infrast", "Recruit", "Mall", "Award", "Roguelike", "Co
 
 def _adapter(tmp: Path, *, connected: bool = True):
     """构造一个接了 fake wrapper 的 adapter（真实 `MaaAdapter`，白名单在它里面）。"""
-    import asyncio  # noqa: F401  （仅用于文档性说明：本文件在用例内驱动协程）
-
     A = _adapter_mod()
     w, fake = _loaded(tmp)
     handle = w.create_instance()
@@ -2034,13 +2027,16 @@ def test_a04_reordered_events_still_backfill():
 
     a = run(forward, False)
     b = run(backward, True)
-    key = lambda p: (
-        p.connected,
-        p.uuid,
-        p.resolution.status,
-        p.resolution.width,
-        p.resolution.height,
-    )
+
+    def key(p):
+        return (
+            p.connected,
+            p.uuid,
+            p.resolution.status,
+            p.resolution.width,
+            p.resolution.height,
+        )
+
     assert key(a) == key(b), f"顺序敏感的结论：{key(a)} != {key(b)}"
     assert key(a) == (True, "emu-1234", A.ResolutionStatus.KNOWN, 1920, 1080), f"结论不对：{key(a)}"
 
@@ -2873,18 +2869,6 @@ async def test_a18_reconnecting_never_resends_connect():
 #   6. 断言只认可观测事实：`state` / `last_error` 的类型与 `kind` / 磁盘上有没有那个
 #      文件 / fake lib 的调用计数。不读私有缓存做判断。
 
-import builtins
-import errno
-import hashlib
-import http.server
-import io
-import logging
-import os
-import re
-import types
-import zipfile
-from collections import Counter
-
 _RELEASE_URL = (
     "https://github.com/MaaAssistantArknights/MaaAssistantArknights"
     "/releases/download/v9.9.9/MAA-test-only.zip"
@@ -2978,7 +2962,7 @@ def _env(tmp: Path):
         engine_root=data_dir / "maa",
         user_dir=Path(tmp) / "user",
         cache_dir=Path(tmp) / "cache",
-        plugin_dir=Path(__file__).resolve().parents[1],
+        plugin_dir=_bootstrap.PLUGIN_ROOT,
     )
 
 
@@ -4426,7 +4410,7 @@ def test_r17_provision_raises_only_known_errors():
     下面用两份改写过的源码（把 `RuntimeError` 挪进运行期 / 自定义一个异常类）证明
     扫描器有牙 —— 换成 §3 变异矩阵 M42 / M44 的形态，它必须红。
     """
-    src_path = Path(__file__).resolve().parents[1] / "maa" / "provision.py"
+    src_path = _bootstrap.PLUGIN_ROOT / "maa" / "provision.py"
     assert src_path.is_file(), f"找不到被测源码 {src_path}"
     source = src_path.read_text(encoding="utf-8")
 
@@ -5145,7 +5129,7 @@ def test_x01_case_ids_match_plan_doc():
     """
     import re
 
-    doc = Path(__file__).resolve().parents[1] / "docs" / "02-test-plan.md"
+    doc = _bootstrap.PLUGIN_ROOT / "docs" / "02-test-plan.md"
     assert doc.is_file(), f"找不到测试计划：{doc}"
     pattern = re.compile(r"\|\s*([WARPX]\d{2})\s*\|")
     documented: set[str] = set()
@@ -5200,7 +5184,7 @@ def test_x03_service_import_direction():
     """
     import ast
 
-    service = Path(__file__).resolve().parents[1] / "companion" / "service.py"
+    service = _bootstrap.PLUGIN_ROOT / "companion" / "service.py"
     if not service.is_file():
         raise Blocked(f"companion/service.py 尚未落盘：{service}")
     tree = ast.parse(service.read_text(encoding="utf-8"))
@@ -5679,7 +5663,6 @@ def test_p07_missing_or_duplicated_core_library_rejected():
     """
     EV = _errors_mod()
     P = _provision_mod()
-    RT = _runtime_mod()
 
     with _tmpdir() as tmp:
         # ① 没有核心库
@@ -6137,7 +6120,6 @@ def test_p17_short_long_and_html_errors_clean_up():
 
     服务器"200 + 错误页"是最常见的"看起来成功"：长度不对必须早停。
     """
-    P = _provision_mod()
     EV = _errors_mod()
     data = b"x" * 4096
     size = len(data)

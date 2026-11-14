@@ -1,6 +1,6 @@
-# 进度快照 · 2026-11-14 09:55
+# 进度快照 · 2026-11-14 13:40
 
-> 状态：**第一轮收尾完成 —— 两套测试全绿、17 个文件落盘、已推送远程。**
+> 状态：**第二轮收尾完成 —— 两套测试全绿（126 条）、CI 的 ruff 告警清零（38→0）、已推送远程。**
 > 仓库：`D:\Copilot_work\neko-plugin`，分支 `main`，远程 `LSwzx/arknights-neko-plugin`。
 
 ## 一、当前基线（实测，不是估计）
@@ -31,8 +31,9 @@ python tests/test_service.py    →  通过 16 / 16，失败 0，未实现 0，�
 | `companion/service.py` | 2196 | ✅ 文案表 / `sanitize_maa_text`（路径折叠已补齐）/ `submitted` 判据 / image part 直推 / 连接配置与 extras 透传 |
 | `companion/logic.py` | 253 | ✅ `AutomationRequest` + `execute_automation()` 占位（**只读三类，绝不执行写任务**） |
 | `companion/knowledge.py` | 446 | ✅ 静态知识，零 I/O，数值一律留空（`# TODO_VERIFY`） |
-| `tests/test_contract.py` | 6532 | ✅ 110 条全绿（W26 / W28–W36 / A15–A18 / R19–R25 / P28 / X4） |
-| `tests/test_service.py` | 1953 | ✅ 16 条全绿（S01–S16） |
+| `tests/test_contract.py` | 6535 | ✅ 110 条全绿（W26 / W28–W36 / A15–A18 / R19–R25 / P28 / X4） |
+| `tests/test_service.py` | 1947 | ✅ 16 条全绿（S01–S16） |
+| `tests/_bootstrap.py` | 52 | ✅ `sys.path` 引导收进 import 期副作用（CI 的 `E402` 无法用 noqa 抑制，见 §七） |
 | `tests/_mut_{a,r,p}.py` | — | ✅ 9/9、4/4、4/4 |
 | `tests/_mut_matrix.py` | — | ✅ 26 条 / 杀 22（4 条等价变异，已配对双拆证明） |
 | `tests/_mut_s.py` | — | ✅ 9 条 / 杀 8（M-S4 等价变异） |
@@ -86,3 +87,26 @@ python tests/_mut_s.py M-S7 /tmp/mutS/plg   # 验牙：副本树上跑，M-S7 �
 
 设计口径以 `docs/01-architecture.md` 为权威；用例编号/总数以 `tests/test_contract.py --list` 为准（当前 **110**）。
 **总数口径 = 110 + 16 = 126**（文档里若出现 104/105/106 是历史中间值，已改）。
+
+## 七、CI 同参复验（ruff）
+
+CI 的 verify 步骤带 `--ignore-noqa --isolated`（原文见 `ruff.toml` 顶部注释），
+所以**本地 `ruff check .` 与 CI 不等价**：它尊重 `# noqa`、且会读 `ruff.toml`，
+会漏掉 CI 仍会报的错（2026-11-14 那 38 条里，9 条只在 CI 出现）。
+
+等价复验必须带同一套参数：
+
+```
+python -m ruff check --ignore-noqa --isolated --no-respect-gitignore \
+    --target-version py311 --line-length 120 \
+    --select E4,E7,E9,F,I --exclude vendor .
+```
+
+版本也要对齐：CI 锁定 `ruff==0.12.4`，不同版本个别规则会漂。
+本机 PyPI 源不通时，可直接取官方二进制（先校验 sha256 再解压，二进制约 27 MB）：
+
+```
+https://github.com/astral-sh/ruff/releases/download/0.12.4/ruff-x86_64-pc-windows-msvc.zip
+```
+
+判定标准只有一条：**上面这条命令输出 `All checks passed!`**，而不是"本地 `ruff check .` 绿了"。

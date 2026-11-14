@@ -1,13 +1,14 @@
 """R 组变异验牙（进程内打补丁，不改文件）。只挑三条"守卫型"用例。"""
 import asyncio
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+import _bootstrap
 import test_contract as T
+
 import maa.runtime as M
+
+# 同 `_mut_p.py`：读一次是为了让"副作用导入"不被 pyflakes 判成 F401。
+PLUGIN_ROOT = _bootstrap.PLUGIN_ROOT
 
 
 def run(coro_fn, name):

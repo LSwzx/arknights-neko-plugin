@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import sys
 import time
 import traceback
@@ -166,7 +165,37 @@ def _select(argv: list[str]) -> tuple[list[Case], bool]:
     return list(picked), False
 
 
+def _make_stdout_safe() -> None:
+    """让 `print()` 在任何控制台编码下都不会抛 `UnicodeEncodeError`。
+
+    为什么需要（2026-11-14 实测）：GitHub Actions 的 `windows-latest` 默认用
+    **cp1252** 作为 stdout 编码，而用例 ID / 用例名 / 失败信息全是中文，
+    `print(f"[{status}] {c.id} ...")` 会直接抛 `UnicodeEncodeError`，
+    堆栈落在 `main() -> print(head)`。后果比"输出乱码"严重得多：
+    明明用例跑完了，报告却变成"进程异常退出"，读者只会以为测试没跑起来。
+
+    处理规则（分流，而不是一刀切转 UTF-8）：
+    * stdout 不是终端（CI 的管道、`> log.txt`）→ 改 UTF-8：GitHub 日志按 UTF-8 渲染，
+      中文正常显示；
+    * stdout 是终端（Windows 老 conhost 是 cp936/cp1252）→ **不动 encoding**，
+      只把错误策略改成 `backslashreplace`。硬转 UTF-8 会在 GBK 控制台上输出乱码，
+      而 `\\u4e2d` 这种转义至少能看懂，且不会中断整轮测试。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # 被替换成非 TextIOWrapper（如某些宿主捕获器）
+            continue
+        try:
+            if stream.isatty():
+                reconfigure(errors="backslashreplace")
+            else:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (ValueError, OSError):  # 已写过数据 / 流已关闭：保持原样即可
+            pass
+
+
 def main(module, argv: list[str] | None = None) -> int:
+    _make_stdout_safe()
     argv = list(sys.argv[1:] if argv is None else argv)
 
     selected, listing = _select(argv)

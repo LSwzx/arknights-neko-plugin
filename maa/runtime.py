@@ -31,8 +31,8 @@ import shutil
 import struct
 import tempfile
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,8 +58,8 @@ from .errors import (
 )
 from .provision import (
     KNOWN_RELEASES,
-    ReleaseSpec,
     ExtractResult,
+    ReleaseSpec,
     atomic_download,
     safe_extract,
     verify_sha256,

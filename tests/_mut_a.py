@@ -3,13 +3,11 @@
 每个变异都必须让**指定的那条用例红**。若变异后仍绿，说明用例没压在要点上。
 """
 import sys
-import traceback
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
+import _bootstrap
 import test_contract as T
+
+import maa.adapter as A
 
 
 def run(case_fn, name):
@@ -30,8 +28,6 @@ def patch(obj, attr, factory):
 
 
 results = []
-
-import maa.adapter as A  # noqa: E402
 
 # ---------------------------------------------------------------- M-A1 (A09)
 def m_a1(orig):
@@ -93,7 +89,7 @@ def m_a4(orig):
     def fetch(self, call_id):
         try:
             return orig(self, call_id)
-        except A.CaptureFormatUnexpected as exc:
+        except A.CaptureFormatUnexpected:
             return F.make_png()   # 变异：非 PNG 就二次编码兜底（旧 maa_adapter 的坑）
     return fetch
 
@@ -167,7 +163,7 @@ try:
 except Exception as exc:  # noqa: BLE001 - runtime 暂时 import 不动时，用文档里的七态兜底
     print(f"  [注] maa.runtime 导入失败（{type(exc).__name__}: {exc}），改用七态字面量")
     allowed = {"absent", "downloading", "verified", "unpacked", "loaded", "ready", "failed"}
-src = Path(T.__file__).with_name("..") / "maa" / "adapter.py"
+src = _bootstrap.PLUGIN_ROOT / "maa" / "adapter.py"
 orig_src = src.read_text(encoding="utf-8")
 mut = orig_src.replace('STATE_ABSENT: Final[str] = "absent"', 'STATE_ABSENT: Final[str] = "unloaded"')
 assert mut != orig_src, "变异没生效：没找到 STATE_ABSENT 的赋值行"

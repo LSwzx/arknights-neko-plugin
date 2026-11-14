@@ -17,18 +17,22 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import inspect
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(ROOT))
+import _bootstrap
+import _runner as R
 
-import test_contract as T  # noqa: E402
-import _runner as R  # noqa: E402
+# `test_contract` 是**纯副作用导入**：它的 `@case` 装饰器在导入期把用例登记进
+# `_runner.REGISTRY`，下面的 BY_ID 才有内容。不能写成 `import test_contract as T`
+# 再让 T 闲着 —— CI 的 `ruff --ignore-noqa` 让 `# noqa: F401` 失效，
+# pyflakes 会把这种"只为副作用而导入"判成未使用。
+importlib.import_module("test_contract")
+
+ROOT = _bootstrap.PLUGIN_ROOT
 
 PATHS = {
     "maa.errors": ROOT / "maa" / "errors.py",

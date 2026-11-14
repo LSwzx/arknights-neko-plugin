@@ -17,6 +17,19 @@ extend-exclude = []
 # （`.gitignore` 排的是 *.dll / *.zip / data/ / cache/ 这类运行期产物，本来就不含 .py。）
 respect-gitignore = false
 
+# ⚠️ 本地与 CI 不是同一套运行方式，改代码前先读这段：
+# 上游 verify 调用的是
+#   uvx ruff==0.12.4 check --ignore-noqa --isolated --no-respect-gitignore \
+#       --target-version py311 --line-length 120 --select E4,E7,E9,F,I --exclude vendor
+# 其中两个参数会让"本地绿、CI 红"必然发生：
+#   * `--ignore-noqa`：所有 `# noqa` 一律失效。本地默认尊重 noqa，于是会被吞掉一批
+#     CI 仍会报的错（2026-11-14 那 38 条里，9 条正是只在 CI 出现）。
+#     `ignore-noqa` 只有命令行开关、**没有**配置键，所以本文件无法复刻它；
+#     想本地等价复验，必须显式带这套参数跑（见 docs/STATUS.md 的"CI 同参复验"）。
+#   * `--isolated`：本文件整个不被读取，所以 `[lint.per-file-ignores]` 之类白名单
+#     在 CI 里是**死配置**。不要试图用它给 tests/ 开后门 —— 试过，无效，只能真改代码。
+# 结论：靠注释或白名单掩盖在 CI 里一行都挡不住；告警必须真的消失。
+
 [lint]
 # 只选"确定是 bug"的规则，不选风格规则：
 #   E4 = E401/E402（import 写法），E7 = E701/E702…（语句写法，多为复制粘贴残留），

@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, Protocol, TypedDict
 
 from ..maa.errors import (
+    RESOURCE_CODES,
     CaptureFormatUnexpected,
     DownloadFailure,
     EngineError,
@@ -61,7 +62,6 @@ from ..maa.errors import (
     EngineLoadFailed,
     EngineNotReady,
     ErrorCode,
-    RESOURCE_CODES,
     UnpackFailure,
 )
 from .logic import AdviceBundle, CompanionLogic, PlayerContext

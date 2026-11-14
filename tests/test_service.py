@@ -37,8 +37,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import contextlib
 import importlib
 import inspect
@@ -54,21 +54,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+# 路径引导是 `_bootstrap` 的 import 期副作用，必须排在 `_runner` 之前。
+# 不能用"先调函数再 import"：CI 的 `ruff check --ignore-noqa --isolated`
+# 让 noqa 与 ruff.toml 双双失效，E402 无法抑制（详见 tests/_bootstrap.py）。
+import _bootstrap
+import _runner as R
+from _runner import case
 
-
-def _bootstrap_path() -> None:
-    """单独跑测试时没有宿主包前缀，把插件根与 tests 目录塞进 `sys.path`。"""
-    here = Path(__file__).resolve()
-    for p in (str(here.parents[1]), str(here.parent)):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-
-
-_bootstrap_path()
-
-import _runner as R  # noqa: E402
-from _runner import case  # noqa: E402
+PLUGIN_ROOT = _bootstrap.PLUGIN_ROOT
 
 
 # ---------------------------------------------------------------------------
@@ -1652,7 +1645,6 @@ def test_s15_reconnect_uses_forced_capability_and_never_downgrades():
          `diagnostics['forced'] is False`（能力探测，不是硬依赖）；
          强制重连抛 `EngineError` → 文案渲染 + push 恰好一次，ok=False。
     """
-    S = _svc_mod()
     E = _errors()
 
     # ① 正常：有 connect_forced 就必须用

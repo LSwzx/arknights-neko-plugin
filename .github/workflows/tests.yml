@@ -15,6 +15,12 @@ jobs:
     runs-on: windows-latest
     # 两套用例本机合计约 15s；给 20 分钟是为了"卡住时变红，而不是挂满 6 小时"。
     timeout-minutes: 20
+    env:
+      # windows-latest 的默认 stdout 编码是 cp1252，用例名与失败信息是中文，
+      # 不设这个会直接 UnicodeEncodeError（2026-11-14 的 Tests job 就是这么红的）。
+      # 同时 `tests/_runner.py::_make_stdout_safe()` 还兜了一层，两边都设是为双保险。
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
 
@@ -30,8 +36,8 @@ jobs:
         # 退出码语义（tests/_runner.py）：0 全绿 / 1 有失败 / 2 收集期不一致 /
         # 3 有未实现或被阻塞。三种非零都算红 —— "没跑到"不能算通过。
         #
-        # 路径假设：两个用例文件都用 `Path(__file__).resolve()` 引导 sys.path
-        # （见 test_contract.py::_bootstrap_path），与 cwd 无关；这里按 Actions
+        # 路径假设：两个用例文件都在顶层 `import _bootstrap`，由它的 import 期副作用
+        # 把插件根塞进 sys.path（见 tests/_bootstrap.py），与 cwd 无关；这里按 Actions
         # 默认 cwd（= GITHUB_WORKSPACE = 仓库根）写相对路径即可。
         run: python tests/test_contract.py
 
