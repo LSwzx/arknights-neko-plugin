@@ -5,7 +5,7 @@ line-length = 120
 
 # 迁移说明（2026-11-13 仓库重构）：
 # 旧配置是 `extend-exclude = ["vendor"]`，因为旧结构把第三方代码放 vendor/。
-# 新结构 plugin/plugins/arknights_neko_plugin/ 下没有任何第三方 Python：
+# 扁平化后仓库根没有任何第三方 Python：
 # 引擎二进制由首次启动下载到 data_path("maa")（运行时目录，不入库，全是 .dll / .zip），
 # 仓库内也不再有 vendor/（`git ls-tree -r --name-only HEAD` 可自查）。
 # 所以这一项按实际置空 —— 保留键而不是删掉它，是为了将来真要引第三方时只改这一行，

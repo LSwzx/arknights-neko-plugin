@@ -6,7 +6,7 @@
 ## 一、当前基线（实测，不是估计）
 
 ```
-cd plugin/plugins/arknights_neko_plugin
+cd <仓库根>
 
 python tests/test_contract.py   →  通过 92 / 92，失败 0，未实现 0，阻塞 0   exit 0
 python tests/test_service.py    →  通过 13 / 13，失败 0，未实现 0，阻塞 0   exit 0
@@ -78,7 +78,7 @@ python tests/test_service.py    →  通过 13 / 13，失败 0，未实现 0，�
 ## 六、恢复方式
 
 ```
-cd plugin/plugins/arknights_neko_plugin
+cd <仓库根>
 python tests/test_contract.py            # 92/92
 python tests/test_service.py             # 13/13
 python tests/_mut_s.py M-S7 /tmp/mutS/plg   # 验牙：副本树上跑，M-S7 必须杀 S08

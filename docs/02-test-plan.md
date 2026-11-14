@@ -648,7 +648,7 @@ W04 就会红。[FACT] 这不需要 C 编译器，也不需要真 `MaaCore.dll`�
 ### 5.2 目录布局
 
 ```
-plugin/plugins/arknights_neko_plugin/
+<仓库根>/
 ├── docs/02-test-plan.md        ← 本文件
 ├── maa/{wrapper,adapter,runtime,provision,errors}.py   ← provision 与 errors 是**纯标准库**，可脱宿主单测
 ├── companion/{service,logic,knowledge}.py
@@ -914,7 +914,7 @@ python <sandbox>/scripts/sandbox.py doctor  --root .sandbox
 python <sandbox>/scripts/sandbox.py prepare --root .sandbox          # 克隆/挂载官方仓库
 python <sandbox>/scripts/sandbox.py install --root .sandbox          # 建 venv 装依赖（较重）
 python <sandbox>/scripts/sandbox.py plugin-add --root .sandbox \
-       --src D:/Copilot_work/neko-plugin/plugin/plugins/arknights_neko_plugin
+       --src D:/Copilot_work/neko-plugin
 python <sandbox>/scripts/sandbox.py serve   --root .sandbox          # 常驻，另开终端查路由
 curl -s localhost:<port>/health
 curl -s localhost:<port>/plugin/status

@@ -46,22 +46,17 @@
 | 2 | **配置键变了** | `adb_path` / `adb_address` / `resource_dir` / `maa_log_dir` | `adb_address` / `adb_path` / `verbose_diagnostics` / `max_inline_image_mb` | 删掉旧配置里的 `resource_dir`、`maa_log_dir`（现在不生效）；引擎路径不再可配置 |
 | 3 | **入口 ID 全换，且没有 `sync_*` 了** | `arknights_engine_status` / `arknights_sync_operators` / `arknights_sync_depot` / … | `arknights_status` / `arknights_memory` / … 共 7 个（见下文「7 个入口」） | 引用旧入口 ID 的提示词、快捷指令、Agent 配置都要改；**干员/仓库同步这一轮没有实现**，别指望它们还能调 |
 | 4 | **`auto_start` 必须为 `true`** | 旧清单是 `false`，需手动启动 | 新清单是 `true`，且这是**功能正确性要求** | 不要改回 `false`：service/runtime 都在 `on_startup` 构造，改回 `false` 会让每个入口恒回"引擎还没准备好" |
-| 5 | **目录结构从扁平变分层** | 插件目录 = 仓库根 | 插件在 `plugin/plugins/arknights_neko_plugin/`，仓库根只放 README / ruff / workflows | 重新指向新路径（「加载源码目录」选到 `plugin/plugins/arknights_neko_plugin`）；旧版"ZIP 解压后要改名"的坑不存在了 |
+| 5 | **目录结构回到扁平** | 插件目录 = 仓库根 | 插件**就在仓库根**（`plugin.toml`、`__init__.py`、`maa/`、`companion/` 全部在根，`docs/`、`tests/` 同层） | 「加载源码目录」直接选**仓库根目录**即可；仓库里没有 `plugin/plugins/arknights_neko_plugin/` 这一层了 |
 
 一处**没变**：`store` 的三个键名仍然是 `operators_cache` / `depot_cache` / `last_stage`，
 所以升级后老用户的干员/仓库记忆不会被清空。
 
-## 仓库结构与安装位置
+## 仓库结构
+
+**仓库根就是插件目录**（目录名 = `plugin_id` = `arknights_neko_plugin`）。没有中间层：
 
 ```
-neko-plugin/                                  # 仓库根
-├── README.md
-├── ruff.toml                                 # 仓库级 lint 配置（沿用 Market 模板生成）
-└── .github/workflows/                        # 必须在仓库根，GitHub 才识别
-    ├── verify.yml                            # 复用 N.E.K.O 官方 Verify 工作流
-    └── release.yml                           # 打 tag 时发布 Release
-
-plugin/plugins/arknights_neko_plugin/         # ← 插件本体（目录名 = plugin_id）
+neko-plugin/                                  # ← 仓库根 = 插件目录（目录名 = plugin_id）
 ├── plugin.toml                               # 插件清单
 ├── config.example.toml                       # 配置模板（[arknights] 四键，随插件一起分发）
 ├── __init__.py                               # 宿主接线层：7 个入口纯路由 + 2 个 lifecycle 钩子
@@ -76,17 +71,25 @@ plugin/plugins/arknights_neko_plugin/         # ← 插件本体（目录名 = p
 │   ├── logic.py                              # 自动化请求占位（只读三类，绝不执行写任务）
 │   └── knowledge.py                          # 静态决策知识（关卡 / 肉鸽规则，零 I/O）
 ├── tests/                                    # 零依赖测试（不需要 pytest）
-└── docs/                                     # 设计定版、测试计划、供应链方案、进度快照
+├── docs/                                     # 设计定版、测试计划、供应链方案、进度快照
+├── README.md
+├── ruff.toml                                 # 仓库级 lint 配置（沿用 Market 模板生成）
+├── audit-reports/                            # 本轮审计留档
+└── .github/workflows/                        # 必须在仓库根，GitHub 才识别
+    ├── verify.yml                            # 复用 N.E.K.O 官方 Verify 工作流
+    └── release.yml                           # 打 tag 时发布 Release
 ```
 
 安装方式三选一：
 
-1. N.E.K.O「插件开发」里**加载源码目录**，选择 `plugin/plugins/arknights_neko_plugin`；
+1. N.E.K.O「插件开发」里**加载源码目录**，选择**仓库根目录**；
 2. 「打包」成 `.neko-plugin` 后导入；
-3. `git clone` 后按上面的结构直接指向插件目录。
+3. `git clone` 后把仓库根直接指向宿主（克隆出来的目录名如果是 `neko-plugin`
+   之类，重命名成 `arknights_neko_plugin` —— 宿主按目录名判包名）。
 
-> 旧版本需要手动把解压目录改名为 `arknights_neko_plugin`；**新结构不需要了**，
-> 目录名本来就是对的。
+> 宿主会把 `plugin.toml` 的 `entry` 归一化成 `plugins.<插件目录名>` 再加载，
+> 所以 `entry = "plugin.plugins.arknights_neko_plugin:ArknightsNekoCompanion"`
+> **不用改**；变的只是"仓库根就是那个目录"，而不是"仓库里再套一层"。
 
 ## 首次启动：引擎不随插件分发，自动下载
 
@@ -274,10 +277,9 @@ max_inline_image_mb = 2       # 内联图片上限（MB），超过则先上传�
 
 ## 开发与测试
 
-测试**零第三方依赖**，不需要 pytest，直接在插件目录里跑：
+测试**零第三方依赖**，不需要 pytest，在**仓库根**直接跑：
 
 ```bash
-cd plugin/plugins/arknights_neko_plugin
 
 python tests/test_contract.py        # 契约测试
 python tests/test_contract.py --list # 列出全部用例
@@ -293,15 +295,15 @@ python tests/test_service.py         # 业务层文案 / 推送语义测试
 >
 > **静态检查（`ruff`）本轮未执行。** 构建环境没有可用包索引，`pip install ruff` 取不到包；
 > 这一项是按"未验证"记账，不是"通过"。发布前需在可联网环境跑一次
-> `python -m ruff check plugin/plugins/arknights_neko_plugin`。
+> `python -m ruff check .`（在仓库根执行）。
 
 lint：
 
 ```bash
-python -m ruff check plugin/plugins/arknights_neko_plugin
+python -m ruff check .
 ```
 
-设计文档以 `plugin/plugins/arknights_neko_plugin/docs/01-architecture.md` 为准；
+设计文档以 `docs/01-architecture.md` 为准；
 供应链安全方案见 `docs/03-engine-provisioning.md`；用例计划见 `docs/02-test-plan.md`。
 
 ## 许可证与致谢
