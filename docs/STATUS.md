@@ -110,3 +110,19 @@ https://github.com/astral-sh/ruff/releases/download/0.12.4/ruff-x86_64-pc-window
 ```
 
 判定标准只有一条：**上面这条命令输出 `All checks passed!`**，而不是"本地 `ruff check .` 绿了"。
+
+⚠️ 还有一个只在 CI 暴露的坑：`--isolated` 下 ruff 的 **first-party 判定跟着 cwd 走**。
+cwd 在仓库根时 `maa/` 被认成一等公民（与第三方 import 之间要空行），cwd 在仓库外
+（CI 的 cwd 是外层 N.E.K.O 仓库、被扫的是 `plugin-repo`）时 `maa` 算第三方（要同块排序）。
+两种要求互斥，所以**同一份文件不可能同时满足** —— 2026-11-14 就在这里翻车过一次
+（本地 0 条、CI 3 条 `I001`，全在 `tests/_mut_*.py`）。
+
+因此复验时要跑**两个 cwd**，都过才算过：
+
+```
+python -m ruff check ... .                      # cwd = 仓库根
+cd .. && python -m ruff check ... <仓库绝对路径>  # cwd = 仓库外，等价于 CI
+```
+
+结论性做法：`tests/` 下的脚本**不要在顶层 import `maa.*`**（用
+`importlib.import_module("maa.x")` 取值），这样 import 块的排序与 cwd 无关。

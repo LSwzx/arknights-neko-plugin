@@ -5722,7 +5722,12 @@ def test_p08_extracted_content_matches_archive():
             assert hashlib.sha256(got).hexdigest() == hashlib.sha256(data).hexdigest(), (
                 f"{name} 内容不一致（{len(got)} vs {len(data)} 字节）"
             )
-        assert result.core_lib == dest / "MaaCore.dll", f"core_lib 指错：{result.core_lib}"
+        # `core_lib` 按契约（provision.py::ExtractResult）是**已 resolve** 的绝对路径；
+        # CI 的 TEMP 是 8.3 短名（C:\Users\RUNNER~1\…），不 resolve 期望值就会
+        # 拿短名比长名，跑出了一条只在 CI 出现的假红。
+        assert result.core_lib == (dest / "MaaCore.dll").resolve(), (
+            f"core_lib 指错：{result.core_lib}"
+        )
         if __import__("os").name != "nt":
             exe = next(iter((dest / "resource").rglob("*")), None)
             assert exe is None or exe.is_file()
@@ -5791,7 +5796,9 @@ def test_p10_real_package_shape_counts():
         assert result.skipped_sample == ("lang/zh-CN.txt",), (
             f"skipped_sample 应记下被跳过的那条，实际 {result.skipped_sample!r}"
         )
-        assert result.core_lib == dest / "MaaCore.dll", f"core_lib 指错：{result.core_lib}"
+        assert result.core_lib == (dest / "MaaCore.dll").resolve(), (
+            f"core_lib 指错：{result.core_lib}"  # 同 P08：core_lib 已 resolve，期望值也要 resolve
+        )
         assert (dest / "resource" / "template" / "x.png").is_file(), "子目录没递归放行"
         assert (dest / "README.md").is_file(), "根目录散文件被漏掉了（真实包就是这样）"
         assert not (dest / "externals").exists(), "externals/ 被解出来了（硬排除失效）"
@@ -5890,7 +5897,8 @@ def test_p12_layout_variants_and_fallbacks():
         resource_ok = (tmp / "o4" / "resource" / "a.json").is_file()
         selected4, excluded4 = r4.selected, r4.excluded
 
-    assert core4 == tmp / "o4" / "bin" / "MaaCore.dll", f"bin/ 兜底没生效：{core4}"
+    # 同 P08：core_lib 已 resolve。`_tmpdir` 是延迟删除，此处目录仍在，resolve 有效。
+    assert core4 == (tmp / "o4" / "bin" / "MaaCore.dll").resolve(), f"bin/ 兜底没生效：{core4}"
     assert selected4 == 3, f"selected 应为 3（2 个 bin DLL + 1 个 resource），实际 {selected4}"
     assert excluded4 == 1, f"excluded 应为 1（MAA.exe），实际 {excluded4}"
     assert resource_ok, "resource 没解出来"

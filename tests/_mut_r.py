@@ -1,11 +1,13 @@
 """R 组变异验牙（进程内打补丁，不改文件）。只挑三条"守卫型"用例。"""
 import asyncio
+import importlib
 import sys
 
 import _bootstrap
 import test_contract as T
 
-import maa.runtime as M
+# 同 `_mut_a.py`：`maa.*` 不写成 import 语句，避免 first-party 判定随 cwd 翻转。
+M = importlib.import_module("maa.runtime")
 
 # 同 `_mut_p.py`：读一次是为了让"副作用导入"不被 pyflakes 判成 F401。
 PLUGIN_ROOT = _bootstrap.PLUGIN_ROOT

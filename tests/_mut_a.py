@@ -2,12 +2,18 @@
 
 每个变异都必须让**指定的那条用例红**。若变异后仍绿，说明用例没压在要点上。
 """
+import importlib
 import sys
 
 import _bootstrap
 import test_contract as T
 
-import maa.adapter as A
+# 刻意不用 `import maa.adapter as A`：`--isolated` 下 ruff 的 first-party 判定跟着
+# **cwd** 走 —— cwd 是仓库根时 `maa` 算 first-party（要与上面隔一个空行），
+# cwd 在仓库外（CI 是外层 N.E.K.O 仓库）时算 third-party（要与上面同块排序）。
+# 两种要求互斥，同一份文件不可能同时满足。用 importlib 取值就没有 import 语句，
+# 这个块无论如何都稳定。
+A = importlib.import_module("maa.adapter")
 
 
 def run(case_fn, name):

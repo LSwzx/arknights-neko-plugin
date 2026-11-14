@@ -1,11 +1,13 @@
 """P 组变异验牙：只挑三条"守卫型"用例。每个变异都必须让指定用例红。"""
+import importlib
 import sys
 from pathlib import Path
 
 import _bootstrap
 import test_contract as T
 
-import maa.provision as P
+# 同 `_mut_a.py`：`maa.*` 不写成 import 语句，避免 first-party 判定随 cwd 翻转。
+P = importlib.import_module("maa.provision")
 
 # `import _bootstrap` 的价值全在 import 期副作用（把插件根塞进 sys.path），
 # pyflakes 只按"名字有没有被读取"判断，所以真的读一次；CI 的 `--ignore-noqa`
