@@ -1,6 +1,6 @@
 # 进度快照 · 2026-11-14 13:40
 
-> 状态：**第二轮收尾完成 —— 两套测试全绿（126 条）、CI 的 ruff 告警清零（38→0）、已推送远程。**
+> 状态：**第二轮收尾完成 —— 两套测试全绿（127 条）、CI 的 ruff 告警清零（38→0）、已推送远程。**
 > 仓库：`D:\Copilot_work\neko-plugin`，分支 `main`，远程 `LSwzx/arknights-neko-plugin`。
 
 ## 一、当前基线（实测，不是估计）
@@ -8,14 +8,15 @@
 ```
 cd <仓库根>
 
-python tests/test_contract.py   →  通过 110 / 110，失败 0，未实现 0，阻塞 0   exit 0
+python tests/test_contract.py   →  通过 111 / 111，失败 0，未实现 0，阻塞 0   exit 0
 python tests/test_service.py    →  通过 16 / 16，失败 0，未实现 0，阻塞 0   exit 0
+python tests/test_smoke.py      →  smoke ok（plugin.toml 的 id/entry 自洽）       exit 0
                                 ────────────────────────────────────────
-                                              合计 126 条
+                                     契约 + 业务合计 127 条
 ```
 
 **供应链模块已冻结**（改动前请先看这条）：
-`maa/provision.py` = **1564 行** / 172 条离线断言全绿 / `sha256 db5127ca44b83e21…`（前 16 位）。
+`maa/provision.py` = **1569 行** / 172 条离线断言全绿 / `sha256 b478fac21bb8e3b4…`（前 16 位）。
 
 ## 二、文件清单
 
@@ -26,12 +27,12 @@ python tests/test_service.py    →  通过 16 / 16，失败 0，未实现 0，�
 | `maa/errors.py` | 737 | ✅ 18 码 + 异常族 + `RESOURCE_CODES`；`__str__` 白名单渲染（K9） |
 | `maa/wrapper.py` | 744 | ✅ 纯 ctypes，三条硬契约（父目录 / 原样 PNG / Connected 后不提前 return） |
 | `maa/adapter.py` | 813 | ✅ `Queue`/`Future` 桥接、只读白名单 4 项（`Recruit` 排除）、`Resolution` 三态 |
-| `maa/provision.py` | 1564 | ✅ `ReleaseSpec` + `KNOWN_RELEASES`(仅 windows-x64) + 原子下载/安全解压 |
+| `maa/provision.py` | 1569 | ✅ `ReleaseSpec` + `KNOWN_RELEASES`(仅 windows-x64) + 原子下载/安全解压 + 返回路径统一 resolve |
 | `maa/runtime.py` | 1856 | ✅ 七态状态机、`bootstrap()` 起后台任务立即返回、连接幂等/强制重连、销毁走 daemon 线程（Stop→Destroy→Detach） |
 | `companion/service.py` | 2196 | ✅ 文案表 / `sanitize_maa_text`（路径折叠已补齐）/ `submitted` 判据 / image part 直推 / 连接配置与 extras 透传 |
 | `companion/logic.py` | 253 | ✅ `AutomationRequest` + `execute_automation()` 占位（**只读三类，绝不执行写任务**） |
 | `companion/knowledge.py` | 446 | ✅ 静态知识，零 I/O，数值一律留空（`# TODO_VERIFY`） |
-| `tests/test_contract.py` | 6535 | ✅ 110 条全绿（W26 / W28–W36 / A15–A18 / R19–R25 / P28 / X4） |
+| `tests/test_contract.py` | 6585 | ✅ 111 条全绿（W26 / W28–W36 / A15–A18 / R19–R25 / P29 / X4） |
 | `tests/test_service.py` | 1947 | ✅ 16 条全绿（S01–S16） |
 | `tests/_bootstrap.py` | 52 | ✅ `sys.path` 引导收进 import 期副作用（CI 的 `E402` 无法用 noqa 抑制，见 §七） |
 | `tests/_mut_{a,r,p}.py` | — | ✅ 9/9、4/4、4/4 |
@@ -80,13 +81,13 @@ python tests/test_service.py    →  通过 16 / 16，失败 0，未实现 0，�
 
 ```
 cd <仓库根>
-python tests/test_contract.py            # 110/110
+python tests/test_contract.py            # 111/111
 python tests/test_service.py             # 16/16
 python tests/_mut_s.py M-S7 /tmp/mutS/plg   # 验牙：副本树上跑，M-S7 必须杀 S08
 ```
 
-设计口径以 `docs/01-architecture.md` 为权威；用例编号/总数以 `tests/test_contract.py --list` 为准（当前 **110**）。
-**总数口径 = 110 + 16 = 126**（文档里若出现 104/105/106 是历史中间值，已改）。
+设计口径以 `docs/01-architecture.md` 为权威；用例编号/总数以 `tests/test_contract.py --list` 为准（当前 **111**）。
+**总数口径 = 111 + 16 = 127**（文档里若出现 104/105/106 是历史中间值，已改）。
 
 ## 七、CI 同参复验（ruff）
 

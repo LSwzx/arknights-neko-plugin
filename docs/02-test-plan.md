@@ -479,6 +479,7 @@ SetConnectionExtras → Connect`。
 | P26 | provision | 3 MB payload，`on_progress` 回调 | 至少调用 1 次；最后一次 `downloaded == total`；**回调自身抛异常时 `.part` 仍被删除** | 进度回调是 UI 注入的，它出错不能污染清理路径 |
 | P27 | provision | 检查 `KNOWN_RELEASES` 每一项 | 每项 `sha256` 是 64 位小写 hex、`size_bytes > 0`、`url` 是**tag 固定**形式（含 `releases/download/v{version}/`）、**不含 `releases/latest`**；平台键在支持矩阵内 | `releases/latest` 的资产集合会变；哈希与 URL 必须是发版时固化的常量 |
 | P28 | provision | 异步包装：`await` 中被 `task.cancel()` | `cancel` event 已置位；工作线程收尾后 `.part` 不存在 | 协程返回了但线程还在写盘 → 下次启动读到半个文件 |
+| P29 | provision | Windows 8.3 短名 / POSIX 父目录软链作为 `dest` 的别名 | `ExtractResult.dest`、`core_lib`、`resource_dir` 均为 resolved 绝对路径且相对关系一致 | 短名与长名、软链与真实路径混用 → 路径比较及诊断形态不一致 |
 
 
 ## 4. 变异清单（验收"测试有牙"的唯一标准）
@@ -1236,3 +1237,4 @@ S13 会立刻红。这条比给静态表写 20 条断言有用。
 | P26 | `test_p26_progress_callback_cannot_break_cleanup` | test_contract.py |
 | P27 | `test_p27_known_releases_constants_are_pinned` | test_contract.py |
 | P28 | `test_p28_async_cancel_stops_worker_before_return` | test_contract.py |
+| P29 | `test_p29_extract_result_paths_are_resolved_consistently` | test_contract.py |

@@ -286,9 +286,9 @@ def _machine() -> str:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class ExtractResult:
-    """解压产物。``core_lib`` 是**已 resolve** 的绝对路径，直接交给 wrapper。
+    """解压产物。``dest`` / ``core_lib`` / ``resource_dir`` 均为**已 resolve** 的绝对路径。
 
-    ``core_lib`` 的类型标了 ``Path | None`` 是为了与架构文档的签名一致；实际
+    ``core_lib`` 直接交给 wrapper；其类型标了 ``Path | None`` 是为了与架构文档的签名一致；实际
     **成功路径恒非 None** —— 0 命中/多命中都会抛 :class:`EngineLayoutInvalid`。
     """
 
@@ -889,7 +889,8 @@ def safe_extract(
             "解压成功但加载不上"的谜案。
 
     Returns:
-        :class:`ExtractResult`。``core_lib`` 是已 resolve 的绝对路径。
+        :class:`ExtractResult`。``dest`` / ``core_lib`` / ``resource_dir`` 都是已 resolve
+        的绝对路径，即使调用方经 Windows 短名或父目录软链指定 ``dest`` 也不例外。
 
     Raises:
         EngineUnpackFailed: 包损坏 / 条目不安全 / 超上限 / 实际字节与声明不符 /
@@ -923,6 +924,10 @@ def safe_extract(
             detail="解压目标已存在（拒绝与已有目录合并）",
         )
 
+    # 必须先按原始路径拒绝预置链接，再 resolve：反过来的话，指向不存在目标的
+    # 断链会被解析成普通路径，绕过上面的安全检查。这里归一化的是父目录里的
+    # 短名/软链，让 dest、core_lib、resource_dir 对外保持同一种路径形态。
+    destp = destp.resolve()
     destp.parent.mkdir(parents=True, exist_ok=True)
     created_root = False
     # 供 `except` 分支算"还需要多少空间"：预检没跑完就 ENOSPC 时它是 0，

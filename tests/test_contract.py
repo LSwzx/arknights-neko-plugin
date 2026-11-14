@@ -6535,6 +6535,48 @@ def test_p28_async_cancel_stops_worker_before_return():
     assert not dest.exists() and not lock, "取消后残留"
 
 
+@case("P29", "provision", "paths")
+def test_p29_extract_result_paths_are_resolved_consistently():
+    """P29 · 经短名/父目录软链解压时，`dest`、`core_lib`、`resource_dir` 必须同为 resolved 路径。
+
+    只拿普通绝对路径断言 `result.dest == dest.resolve()` 是假绿：旧实现在这种输入上也相等。
+    因此 Windows 用 8.3 短名、其他平台用父目录符号链接，先证明别名与真实路径确实不同，
+    再断言三个返回字段的归一化形态与相对关系。
+    """
+    P = _provision_mod()
+    payload = _engine_zip()
+    spec = _release(payload)
+    with _tmpdir() as tmp:
+        archive = tmp / "engine.zip"
+        archive.write_bytes(payload)
+
+        if sys.platform == "win32":
+            short = ctypes.create_unicode_buffer(32768)
+            length = ctypes.windll.kernel32.GetShortPathNameW(str(tmp), short, len(short))
+            assert 0 < length < len(short), f"GetShortPathNameW 失败或缓冲不足：length={length}"
+            alias = Path(short.value)
+        else:
+            real_parent = tmp / "real-parent"
+            real_parent.mkdir()
+            alias = tmp / "alias-parent"
+            alias.symlink_to(real_parent, target_is_directory=True)
+
+        # 样本必须有牙：若别名和真实路径相同，下面的断言无法抓住漏掉 resolve 的回归。
+        assert alias.resolve() != alias, f"没能构造出路径别名：{alias}"
+        dest = alias / "engine"
+        result = P.safe_extract(archive, dest, spec)
+
+        assert result.dest == dest.resolve(), (
+            f"ExtractResult.dest 未归一化：{result.dest}（期望 {dest.resolve()}）"
+        )
+        assert result.dest.is_absolute(), f"dest 不是绝对路径：{result.dest}"
+        assert result.core_lib == result.dest / "MaaCore.dll", (
+            f"core_lib 与 dest 形态不一致：dest={result.dest}, core_lib={result.core_lib}"
+        )
+        assert result.resource_dir == result.dest / "resource", (
+            f"resource_dir 与 dest 形态不一致：dest={result.dest}, resource_dir={result.resource_dir}"
+        )
+
 
 # === END PLACEHOLDERS ===
 
