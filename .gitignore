@@ -44,6 +44,7 @@ data/
 cache/
 resource/
 *.db
+store.db
 *.db-journal
 *.sqlite
 *.sqlite3
@@ -53,7 +54,11 @@ engine.json
 _snapshots/
 
 # ---- 编辑器与系统 ----
-.vscode/
+# `.vscode/` 整体忽略，但下面两个文件是市场发布检查（check -r，strict）要求的
+# 包结构，必须入库；其余编辑器本地状态仍然不跟踪。
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
 .idea/
 .DS_Store
 Thumbs.db
